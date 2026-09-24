@@ -25,11 +25,14 @@
     user-select: none;
   }
   #ui.show { opacity: 1; transform: translate(-50%, 0); }
-  #chapters { display: flex; justify-content: space-between; font-size: 19px; letter-spacing: 2px; }
+  #chapters { display: flex; justify-content: space-between; margin-right: 64px; font-size: 19px; letter-spacing: 2px; }
   #chapters span { opacity: .38; transition: opacity .6s, color .6s; }
   #chapters span.on { opacity: 1; color: rgba(150, 40, 30, .92); }
   #bar { margin-top: 9px; height: 2px; background: rgba(60, 45, 30, .14); position: relative; }
   #fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: rgba(40, 32, 26, .72); }
+  #other { position: absolute; right: 14px; top: 10px; font-size: 13px; color: inherit; opacity: .6; text-decoration: none; }
+  #other:hover { opacity: 1; }
+  #ui.show #other { pointer-events: auto; }
   #hint { margin-top: 7px; font: 11px/1.2 Georgia, "Songti SC", serif; letter-spacing: 1px; opacity: .55; text-align: center; }
   #paused {
     position: fixed; top: 24px; right: 28px; font: 22px "Ma Shan Zheng", KaiTi, STKaiti, serif;
@@ -51,6 +54,7 @@
 <div id="ui">
   <div id="chapters"><span>序·滴</span><span>山</span><span>荷</span><span>梅</span><span>流</span></div>
   <div id="bar"><div id="fill"></div></div>
+  <a id="other" href="watercolor.html">水彩版 ›</a>
   <div id="hint">SPACE / 点击 暂停 · R 重播 · F 全屏 · M 声音</div>
 </div>
 <div id="paused">暫停</div>

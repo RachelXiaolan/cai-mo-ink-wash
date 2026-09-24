@@ -7,3 +7,14 @@ Open `index.html` directly in a browser. Controls: `SPACE` / click to pause, `R`
 Music is synthesised live with Web Audio (guqin-like plucks, xiao flute, drone, water drops, stone chime in D pentatonic) and scheduled against simulation time. Browsers block sound until a gesture, so the first tap turns sound on.
 
 Optional URL parameters: `?res=480` sets the simulation resolution (default 640), `?t=60` fast-forwards, and `?seed=123` changes the seed.
+
+## 小水彩 Little Watercolour
+
+`watercolor.html` is a playful sibling built on the same stateful GPU simulation. It runs about 120 seconds in five chapters: 滴答 (drip), 彩虹 (rainbow), 花园 (garden), 池塘 (pond), 派对 (party).
+
+- Bright transparent watercolours on cold-press paper, with raking-light relief and granulation.
+- Crisp dried edges, and per-character coloured lettering.
+- A round 乐 stamp at the end.
+- A bouncy C-pentatonic soundtrack: marimba, glockenspiel, pizzicato bass, shaker and bubbles.
+
+It uses the same controls and URL parameters as the ink version. Each page links to the other in its bottom bar.
