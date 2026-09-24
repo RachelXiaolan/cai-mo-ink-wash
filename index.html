@@ -177,15 +177,15 @@ const TL = {
   // re-wetting windows: evaporation slows, then a short drying burst before the next chapter paints
   dry: track([[0, .0017], [18.5, .0017], [19.5, .0008], [23.8, .0008], [24.4, .0034], [25.4, .0017], [57, .0017], [58, .0008],
               [61.2, .0008], [61.8, .0036], [63.0, .0016], [86, .0016], [86.8, .0008], [90.6, .0008], [91.2, .0036], [92.4, .0017],
-              [118, .0017], [119, .0006], [133, .0006], [138, .0034], [150, .0034]]),
+              [118, .0017], [119, .0006], [129.5, .0006], [133.5, .004], [150, .0036]]),
   // re-dissolution of dried pigment (strong only while a chapter is being washed away)
   lift: track([[0, .0004], [18.8, .0004], [19.8, .016], [23.6, .016], [25, .0004], [57, .0004], [57.8, .018], [61.0, .018], [62.0, .0004],
                [86, .0004], [86.8, .018], [90.6, .018], [91.6, .0004], [118.5, .0004], [119.3, .02], [121.6, .02], [122.4, .001], [150, .001]]),
   // thinning of dissolved pigment in standing water
   dilute: track([[0, 0], [18.8, 0], [20, .008], [23.4, .008], [24.2, 0], [57, 0], [58, .011], [60.8, .011], [61.6, 0],
                  [86, 0], [87, .006], [90.4, .006], [91.2, 0], [118.5, 0], [119.3, .013], [121.4, .013], [122.0, 0]]),
-  pigDiff: track([[0, 1], [119, 1], [121, .45], [138, .45], [141, 1]]),
-  deposit: track([[0, 1], [120, 1], [121.5, .28], [133, .28], [137, 1.3], [150, 1.3]]),
+  pigDiff: track([[0, 1], [119, 1], [121, .25], [136, .25], [139, 1]]),
+  deposit: track([[0, 1], [120, 1], [121.5, .3], [125, .3], [127, .7], [131, 1.3], [150, 1.3]]),
   paperReveal: track([[0, 0], [0.4, 0], [3.2, 1]]),
 };
 // External slow force fields (only one dominant at a time).
@@ -195,7 +195,7 @@ const FORCES = [
   { type: 1, t0: 18.5, t1: 26, rin: 3, rout: 3, c: [0.74, 0.46], R: 0.34, fp: [1.25, 0.9, 0, 0], s: 0.85 },
   { type: 2, t0: 57, t1: 64, rin: 2, rout: 2.5, c: [0.80, 0], R: 1, fp: [0.30, 0.62, 4.0, 0], s: 0.7 },
   { type: 3, t0: 86.5, t1: 92.4, rin: 2, rout: 1.5, c: [0, 0], R: 0.2, fp: [0, 0, 0.012, 0], s: 0.5, line: BRANCH_LINE },
-  { type: 4, t0: 121.0, t1: 139.5, rin: 4, rout: 7, c: [0.80, 0.50], R: 0.42, fp: [0.15, 0.14, 0, 0], s: 1.0 },
+  { type: 4, t0: 121.0, t1: 136.5, rin: 4, rout: 5.5, c: [0.80, 0.50], R: 0.42, fp: [0.15, 0.14, 0, 0], s: 1.0 },
 ];
 function forceAt(t) {
   let best = null, env = 0;
@@ -831,14 +831,15 @@ function buildScene(seed) {
   wash(18.6, 3.0, 0.74, 0.455, 0.16, 0.25, { water: 2.4, elong: 2.0, shape: 0.3 });
   wash(19.2, 2.6, 0.70, 0.40, 0.08, 0.14, { water: 1.2, elong: 1.6, shape: 0.4 });
   wash(19.4, 2.6, 0.84, 0.52, 0.08, 0.14, { water: 1.2, elong: 1.6, shape: 0.4 });
-  wash(20.0, 3.0, 1.25, 0.43, 0.12, 0.23, { water: 2.4, elong: 0.55, shape: 0.35 });
+  wash(20.0, 3.0, 1.25, 0.34, 0.10, 0.17, { water: 2.4, elong: 1.0, shape: 0.25 });
+  wash(20.4, 3.0, 1.25, 0.53, 0.10, 0.17, { water: 2.4, elong: 1.0, shape: 0.25 });
 
   /* ---------- CHAPTER 2 · 山 (22–58 s) ---------- */
   const farF = ridgeFn([[0.30, 0.09, 0.10], [0.62, 0.075, 0.09], [0.95, 0.12, 0.10], [1.24, 0.07, 0.08], [1.50, 0.045, 0.07]], 0.47);
   mountain(25.2, 0.04, 1.58, farF, 0.52, {
-    segs: 3, ridgeDur: 5.0, layers: 4, bodyGap: 0.7, bodyDur: 2.4,
+    segs: 3, ridgeDur: 5.0, layers: 3, bodyGap: 0.7, bodyDur: 2.4,
     ridge: { pig: { ink: 0.45, indigo: 0.5 }, width: 0.011, water: 0.95, amount: 0.34, dry: 0, dryGain: 0.1, depFrac: 0.05 },
-    body: { pig: { ink: 0.35, indigo: 0.55 }, width: 0.045, water: 1.1, amount: 0.17, dryGain: 0.05, depFrac: 0.02 },
+    body: { pig: { ink: 0.35, indigo: 0.55 }, width: 0.07, water: 1.2, amount: 0.12, dryGain: 0.05, depFrac: 0.02 },
   });
   // distant moss dots on far ridge
   for (let i = 0; i < 16; i++) {
@@ -847,9 +848,9 @@ function buildScene(seed) {
   }
   const midF = ridgeFn([[0.12, 0.22, 0.10], [0.36, 0.16, 0.10], [0.62, 0.09, 0.09], [0.90, 0.045, 0.08]], 0.66);
   mountain(32.2, 0.0, 1.08, midF, 0.68, {
-    segs: 2, ridgeDur: 4.4, layers: 4, bodyGap: 0.6, bodyDur: 2.2,
+    segs: 2, ridgeDur: 4.4, layers: 3, bodyGap: 0.6, bodyDur: 2.2,
     ridge: { pig: { ink: 0.7, ochre: 0.35 }, width: 0.012, water: 0.6, amount: 0.7, dry: 0.12, dryGain: 0.35, depFrac: 0.2 },
-    body: { pig: { ink: 0.45, ochre: 0.5 }, width: 0.045, water: 1.0, amount: 0.26, dryGain: 0.1, depFrac: 0.03 },
+    body: { pig: { ink: 0.45, ochre: 0.5 }, width: 0.065, water: 1.1, amount: 0.2, dryGain: 0.1, depFrac: 0.03 },
   });
   // 披麻皴: hemp-fibre texture strokes down the slopes
   for (let i = 0; i < 9; i++) {
@@ -1065,7 +1066,7 @@ function buildScene(seed) {
   /* ---------- CHAPTER 5 · 流 (120–150 s) : eight-colour vortex ---------- */
   const VC = [0.80, 0.50];
   // keep the vortex wet while it turns
-  for (let i = 0; i < 11; i++) {
+  for (let i = 0; i < 7; i++) {
     const a = R(0, Math.PI * 2), d = R(0, 0.26);
     wash(121.5 + i * 1.1, 1.2, VC[0] + Math.cos(a) * d, VC[1] + Math.sin(a) * d * 0.9, 0.12, 0.16, { water: 0.42, shape: 0.35 });
   }
