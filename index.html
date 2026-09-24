@@ -1,0 +1,1345 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>彩墨 Ink Wash</title>
+<!-- Optional calligraphy font. If it cannot load (offline), KaiTi / STKaiti / serif are used instead. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&display=swap&text=%E5%BD%A9%E5%A2%A8%E5%88%86%E4%BA%94%E8%89%B2%E4%B9%8B%E5%8D%B0%E5%BA%8F%E6%BB%B4%E5%B1%B1%E8%8D%B7%E6%A2%85%E6%B5%81%C2%B7">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f4efe2; }
+  body.idle { cursor: none; }
+  canvas#c { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #ui {
+    position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 8px);
+    width: min(560px, calc(100vw - 32px)); box-sizing: border-box;
+    padding: 12px 20px 11px; border-radius: 3px;
+    background: rgba(246, 241, 229, 0.62);
+    box-shadow: 0 0 0 1px rgba(60, 45, 30, 0.10);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    color: rgba(40, 32, 26, 0.82);
+    font-family: "Ma Shan Zheng", KaiTi, STKaiti, "Kaiti SC", serif;
+    opacity: 0; transition: opacity .8s ease, transform .8s ease; pointer-events: none;
+    user-select: none;
+  }
+  #ui.show { opacity: 1; transform: translate(-50%, 0); }
+  #chapters { display: flex; justify-content: space-between; font-size: 19px; letter-spacing: 2px; }
+  #chapters span { opacity: .38; transition: opacity .6s, color .6s; }
+  #chapters span.on { opacity: 1; color: rgba(150, 40, 30, .92); }
+  #bar { margin-top: 9px; height: 2px; background: rgba(60, 45, 30, .14); position: relative; }
+  #fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: rgba(40, 32, 26, .72); }
+  #hint { margin-top: 7px; font: 11px/1.2 Georgia, "Songti SC", serif; letter-spacing: 1px; opacity: .55; text-align: center; }
+  #paused {
+    position: fixed; top: 24px; right: 28px; font: 22px "Ma Shan Zheng", KaiTi, STKaiti, serif;
+    color: rgba(40, 32, 26, .6); opacity: 0; transition: opacity .5s; pointer-events: none;
+  }
+  #paused.show { opacity: 1; }
+  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    font: 16px/1.6 KaiTi, STKaiti, serif; color: #3a2e25; text-align: center; padding: 24px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div id="chapters"><span>序·滴</span><span>山</span><span>荷</span><span>梅</span><span>流</span></div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="hint">SPACE / 点击 暂停 · R 重播 · F 全屏</div>
+</div>
+<div id="paused">暫停</div>
+<div id="err"></div>
+
+<script>
+'use strict';
+/* =====================================================================
+   彩墨 Ink Wash — stateful GPU ink-wash simulation (WebGL2, no libraries)
+
+   Every frame the paper state lives in three RGBA16F textures that are
+   ping-ponged (A → sim → B → sim → A):
+     WATER : r = surface water / wetness, gb = flow velocity (texels/step),
+             a = paper absorbency (baked from the procedural 宣纸 texture)
+     PIG   : rgb = mobile pigment (optical density, per channel)
+     DEP   : rgb = deposited / dried pigment (optical density), a = tide stain
+   Brush dabs and ink drops are splatted additively into the current state,
+   then the simulation shader advances wetness, diffusion, pigment transport,
+   edge deposition and re-dissolution. Colour is composited subtractively
+   (Beer–Lambert absorption), so pigments darken when they overlap.
+   ===================================================================== */
+
+/* ============================== CONFIG ============================== */
+const QS = new URLSearchParams(location.search);
+const CONFIG = {
+  seed: +(QS.get('seed') || 20260924),
+  duration: 150,                  // seconds of painting
+  fadeOut: [150, 154],            // slow fade back to blank paper, then loop
+  aspect: 1.6,                    // simulation / composition aspect (x ∈ [0,1.6], y ∈ [0,1])
+  simHeight: +(QS.get('res') || 640), // internal simulation resolution (height, px)
+  paperScale: 2,                  // paper + glyph textures are rendered at 2× sim res
+  step: 1 / 60,                   // fixed simulation timestep (s)
+  simIterations: 2,               // solver iterations per timestep
+  maxStepsPerFrame: 2,            // never skip steps: if slower, the whole film slows down
+  dprMax: 2,
+
+  // base solver coefficients (per iteration); timeline tracks scale some of them
+  sim: {
+    waterDiff: 0.14,   // water conductance between neighbours (≤ 0.16 for stability)
+    pigDiff:   0.035,  // Fickian pigment diffusion inside wet paper
+    carry:     0.85,   // how much pigment the flowing water carries (→ blooms, dark rims)
+    retain:    0.025,  // paper holds water below this level (sizing) → crisp feathered fronts
+    deposit:   0.0022, // base settling of pigment into fibres
+    edgeDep:   0.9,    // extra deposition on the wet→dry gradient (pigment ring)
+    dryDep:    0.05,   // deposition as the paper becomes almost dry
+    relax:     0.03,   // velocity relaxation toward the external force target
+    stain:     0.35,   // tide-line water stain strength
+    edgeEvap:  1.6,    // thin water at the edge evaporates faster
+  },
+
+  brush: {
+    spacing: 0.14,     // dab spacing as a fraction of brush radius
+    pressureWidth: 0.7 // how strongly pressure widens the brush
+  },
+
+  camera: { scale0: 1.014, scale1: 1.036, rot: 0.0022 },
+  ui: { hideDelay: 2600 },
+
+  chapters: [
+    { name: '序·滴', t0: 0 },
+    { name: '山', t0: 22 },
+    { name: '荷', t0: 58 },
+    { name: '梅', t0: 88 },
+    { name: '流', t0: 120 },
+  ],
+};
+const A = CONFIG.aspect;
+const STEP = CONFIG.step;
+const SIM_H = Math.round(CONFIG.simHeight);
+const SIM_W = Math.round(SIM_H * A);
+const PX = 1 / SIM_H; // one sim texel in scene units
+
+/* ============================== PALETTE ============================= */
+// Eight traditional Chinese painting pigments. rgb = appearance of one unit
+// of pigment on the paper. K = -ln(rgb / paper) = absorption per unit, so
+// overlapping pigments multiply (subtractive), never add light.
+const PAPER_RGB = [0.957, 0.938, 0.886];
+const PALETTE = {
+  ink:       { name: '墨黑', rgb: [0.135, 0.125, 0.118] },
+  cinnabar:  { name: '朱砂', rgb: [0.79, 0.27, 0.17] },
+  rouge:     { name: '胭脂', rgb: [0.64, 0.17, 0.29] },
+  azurite:   { name: '石青', rgb: [0.20, 0.42, 0.62] },
+  malachite: { name: '石绿', rgb: [0.33, 0.58, 0.47] },
+  gamboge:   { name: '藤黄', rgb: [0.88, 0.70, 0.22] },
+  indigo:    { name: '花青', rgb: [0.25, 0.33, 0.44] },
+  ochre:     { name: '赭石', rgb: [0.63, 0.42, 0.26] },
+};
+for (const k in PALETTE) {
+  PALETTE[k].K = PALETTE[k].rgb.map((c, i) => -Math.log(Math.max(0.02, Math.min(1, c / PAPER_RGB[i]))));
+}
+// mixK({ink:.6, indigo:.4}) → blended absorption vector (weights need not sum to 1)
+function mixK(spec) {
+  if (typeof spec === 'string') return PALETTE[spec].K.slice();
+  const out = [0, 0, 0];
+  for (const k in spec) for (let i = 0; i < 3; i++) out[i] += PALETTE[k].K[i] * spec[k];
+  return out;
+}
+
+/* ============================== UTIL ================================ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ss = x => { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); };
+// keyframe track with smooth interpolation: [[t, v], ...]
+function track(keys) {
+  return t => {
+    if (t <= keys[0][0]) return keys[0][1];
+    for (let i = 1; i < keys.length; i++) {
+      if (t < keys[i][0]) {
+        const u = ss((t - keys[i - 1][0]) / (keys[i][0] - keys[i - 1][0]));
+        return lerp(keys[i - 1][1], keys[i][1], u);
+      }
+    }
+    return keys[keys.length - 1][1];
+  };
+}
+
+/* ============================== TIMELINE ============================ */
+// Global solver modulation. Transitions between chapters are made by
+// re-wetting (washes), lifting dried pigment back into the water (lift),
+// letting it thin out (dilute), and moving it with slow force fields.
+const TL = {
+  // re-wetting windows: evaporation slows, then a short drying burst before the next chapter paints
+  dry: track([[0, .0017], [18.5, .0017], [19.5, .0008], [23.8, .0008], [24.4, .0034], [25.4, .0017], [57, .0017], [58, .0008],
+              [61.2, .0008], [61.8, .0036], [63.0, .0016], [86, .0016], [86.8, .0008], [90.6, .0008], [91.2, .0036], [92.4, .0017],
+              [118, .0017], [119, .0006], [133, .0006], [138, .0034], [150, .0034]]),
+  // re-dissolution of dried pigment (strong only while a chapter is being washed away)
+  lift: track([[0, .0004], [18.8, .0004], [19.8, .016], [23.6, .016], [25, .0004], [57, .0004], [57.8, .018], [61.0, .018], [62.0, .0004],
+               [86, .0004], [86.8, .018], [90.6, .018], [91.6, .0004], [118.5, .0004], [119.3, .02], [121.6, .02], [122.4, .001], [150, .001]]),
+  // thinning of dissolved pigment in standing water
+  dilute: track([[0, 0], [18.8, 0], [20, .008], [23.4, .008], [24.2, 0], [57, 0], [58, .011], [60.8, .011], [61.6, 0],
+                 [86, 0], [87, .006], [90.4, .006], [91.2, 0], [118.5, 0], [119.3, .013], [121.4, .013], [122.0, 0]]),
+  pigDiff: track([[0, 1], [119, 1], [121, .45], [138, .45], [141, 1]]),
+  deposit: track([[0, 1], [120, 1], [121.5, .28], [133, .28], [137, 1.3], [150, 1.3]]),
+  paperReveal: track([[0, 0], [0.4, 0], [3.2, 1]]),
+};
+// External slow force fields (only one dominant at a time).
+// type 1 stretch · 2 horizontal spread · 3 gather to a line · 4 vortex
+const BRANCH_LINE = [[0.10, 1.02], [0.30, 0.80], [0.62, 0.58], [0.92, 0.40], [1.28, 0.18]];
+const FORCES = [
+  { type: 1, t0: 18.5, t1: 26, rin: 3, rout: 3, c: [0.74, 0.46], R: 0.34, fp: [1.25, 0.9, 0, 0], s: 0.85 },
+  { type: 2, t0: 57, t1: 64, rin: 2, rout: 2.5, c: [0.80, 0], R: 1, fp: [0.30, 0.62, 4.0, 0], s: 0.7 },
+  { type: 3, t0: 86.5, t1: 92.4, rin: 2, rout: 1.5, c: [0, 0], R: 0.2, fp: [0, 0, 0.012, 0], s: 0.5, line: BRANCH_LINE },
+  { type: 4, t0: 121.0, t1: 139.5, rin: 4, rout: 7, c: [0.80, 0.50], R: 0.42, fp: [0.15, 0.14, 0, 0], s: 1.0 },
+];
+function forceAt(t) {
+  let best = null, env = 0;
+  for (const f of FORCES) {
+    if (t < f.t0 || t > f.t1) continue;
+    const e = Math.min(ss((t - f.t0) / f.rin), ss((f.t1 - t) / f.rout));
+    if (e > env) { env = e; best = f; }
+  }
+  return { f: best, env };
+}
+
+/* ============================== WEBGL INIT ========================== */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'high-performance' });
+function fail(msg) {
+  const e = document.getElementById('err');
+  e.style.display = 'flex'; e.textContent = msg;
+  throw new Error(msg);
+}
+if (!gl) fail('此作品需要 WebGL2 支持。\nThis piece requires WebGL2.');
+const hasFloatRT = gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float');
+if (!hasFloatRT) fail('此浏览器不支持浮点渲染目标 (EXT_color_buffer_float)。');
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    console.error(src.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n'));
+    fail('Shader compile error:\n' + log);
+  }
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fail('Program link error:\n' + gl.getProgramInfoLog(p));
+  const cache = {};
+  p.u = name => (name in cache) ? cache[name] : (cache[name] = gl.getUniformLocation(p, name));
+  return p;
+}
+
+/* ============================== TEXTURE / FBO INIT ================== */
+function tex(w, h, internal, format, type, filter) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function fbo(textures) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  const bufs = textures.map((t, i) => {
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0);
+    return gl.COLOR_ATTACHMENT0 + i;
+  });
+  gl.drawBuffers(bufs);
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) fail('Framebuffer incomplete: 0x' + st.toString(16));
+  return f;
+}
+function stateSet() {
+  const mk = () => tex(SIM_W, SIM_H, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
+  const s = { water: mk(), pig: mk(), dep: mk() };
+  s.fb = fbo([s.water, s.pig, s.dep]);
+  return s;
+}
+// Ping-pong pair of multi-channel state textures
+let cur = stateSet(), nxt = stateSet();
+const PAPER_W = SIM_W * CONFIG.paperScale, PAPER_H = SIM_H * CONFIG.paperScale;
+const paperTex = tex(PAPER_W, PAPER_H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+const paperFb = fbo([paperTex]);
+const maskTex = tex(PAPER_W, PAPER_H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+const emptyVao = gl.createVertexArray(); // fullscreen triangle uses gl_VertexID
+
+/* ============================== SIMULATION SHADERS ================== */
+const GLSL_HEAD = `#version 300 es
+precision highp float;
+precision highp int;
+`;
+// integer hash based value noise (deterministic, seedable)
+const GLSL_NOISE = `
+uint hsh(uint x){ x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u; return x; }
+float h2(ivec2 p, uint s){ return float(hsh(uint(p.x + 65536) * 0x9E3779B1u + hsh(uint(p.y + 65536) ^ s))) * (1.0 / 4294967296.0); }
+float vnoise(vec2 p, uint s){
+  vec2 i = floor(p); vec2 f = fract(p); ivec2 ii = ivec2(i);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = h2(ii, s), b = h2(ii + ivec2(1,0), s), c = h2(ii + ivec2(0,1), s), d = h2(ii + ivec2(1,1), s);
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float vn(vec2 p){ return vnoise(p, 1337u); }
+float fbm(vec2 p, int oct, uint s){
+  float sum = 0.0, amp = 0.5, norm = 0.0;
+  for (int i = 0; i < 8; i++) {
+    if (i >= oct) break;
+    sum += amp * vnoise(p, s + uint(i) * 101u); norm += amp;
+    p = mat2(1.62, 1.18, -1.18, 1.62) * p; amp *= 0.5;
+  }
+  return sum / norm;
+}
+`;
+const VS_FULL = GLSL_HEAD + `
+out vec2 vUv;
+void main(){
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// ---- 宣纸 procedural rice paper: multi-octave FBM + directional fibres ----
+// r = absorbency (drives water & pigment conductance), g = fibre, b = brightness, a = tooth (dry-brush grain)
+const FS_PAPER = GLSL_HEAD + GLSL_NOISE + `
+in vec2 vUv; out vec4 o;
+uniform uint uSeed; uniform float uAspect; uniform float uFibreAngle;
+float fibreLayer(vec2 p, float ang, float across, float along, uint s){
+  vec2 d = vec2(cos(ang), sin(ang));
+  vec2 q = vec2(dot(p, d), dot(p, vec2(-d.y, d.x)));
+  float n = vnoise(vec2(q.x * along, q.y * across), s);
+  float line = pow(1.0 - abs(n * 2.0 - 1.0), 14.0);            // thin wavy ridge = one fibre
+  float seg = smoothstep(0.42, 0.72, vnoise(vec2(q.x * along * 0.4, q.y * across * 0.05) + 31.0, s + 7u)); // finite fibre length
+  return line * seg;
+}
+void main(){
+  vec2 p = vec2(vUv.x * uAspect, 1.0 - vUv.y);
+  float cloud = fbm(p * 2.6, 6, uSeed);             // large cloudy formation of the sheet
+  float mid   = fbm(p * 13.0 + 7.0, 5, uSeed + 11u); // pulp clumps
+  float fine  = fbm(p * 95.0 + 3.0, 4, uSeed + 23u);
+  float fib = 0.0;
+  fib += fibreLayer(p, uFibreAngle,         240.0, 5.0, uSeed + 41u);
+  fib += fibreLayer(p, uFibreAngle + 0.45,  300.0, 7.0, uSeed + 43u) * 0.8;
+  fib += fibreLayer(p, uFibreAngle - 0.55,  200.0, 4.0, uSeed + 47u) * 0.8;
+  fib += fibreLayer(p, uFibreAngle + 1.7,   340.0, 9.0, uSeed + 53u) * 0.5;
+  fib = clamp(fib, 0.0, 1.0);
+  float absorb = 0.30 + 0.75 * smoothstep(0.30, 0.72, cloud) * 0.6 + 0.22 * (mid - 0.5) + 0.40 * fib + 0.12 * (fine - 0.5);
+  absorb = clamp(absorb, 0.14, 1.0);
+  float bright = clamp(0.5 + (cloud - 0.5) * 0.9 + (mid - 0.5) * 0.5 + (fine - 0.5) * 0.35, 0.0, 1.0);
+  float tooth = clamp(0.5 + (fine - 0.5) * 1.3 + (vnoise(p * 420.0, uSeed + 61u) - 0.5) * 0.6 + fib * 0.25, 0.0, 1.0);
+  o = vec4(absorb, fib, bright, tooth);
+}`;
+
+// ---- state initialisation: dry blank paper, absorbency baked into WATER.a ----
+const FS_INIT = GLSL_HEAD + `
+in vec2 vUv;
+uniform sampler2D uPaper;
+layout(location=0) out vec4 oWater; layout(location=1) out vec4 oPig; layout(location=2) out vec4 oDep;
+void main(){
+  oWater = vec4(0.0, 0.0, 0.0, texture(uPaper, vUv).r);
+  oPig = vec4(0.0); oDep = vec4(0.0);
+}`;
+
+// ---- main stateful ink-wash solver (one iteration) ----
+const FS_SIM = GLSL_HEAD + `
+in vec2 vUv;
+uniform sampler2D uWater;  // r water, gb velocity, a absorbency
+uniform sampler2D uPig;    // rgb mobile pigment OD
+uniform sampler2D uDep;    // rgb deposited OD, a tide stain
+uniform vec2 uTexel; uniform float uAspect;
+uniform float uWaterDiff, uPigDiff, uCarry, uRetain;
+uniform float uDry, uEdgeEvap, uDeposit, uEdgeDep, uDryDep;
+uniform float uLift, uDilute, uRelax, uStain;
+uniform int uForceType; uniform vec2 uFC; uniform float uFR; uniform float uFS; uniform vec4 uFP;
+uniform vec2 uLine[5];
+layout(location=0) out vec4 oWater; layout(location=1) out vec4 oPig; layout(location=2) out vec4 oDep;
+
+// 8-neighbour stencil (diagonals half weight) → more isotropic blooms
+const vec2 OFF[8] = vec2[8](vec2(1,0), vec2(-1,0), vec2(0,1), vec2(0,-1), vec2(1,1), vec2(-1,1), vec2(1,-1), vec2(-1,-1));
+const float WT[8] = float[8](1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5);
+
+float lineDist(vec2 p, out vec2 cp){
+  float best = 1e9;
+  for (int i = 0; i < 4; i++) {
+    vec2 a = uLine[i], b = uLine[i + 1], ab = b - a;
+    float h = clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0);
+    vec2 c = a + ab * h; float d = length(p - c);
+    if (d < best) { best = d; cp = c; }
+  }
+  return best;
+}
+// slow external flow fields in scene space (y down). Returns a unitless direction*profile.
+vec2 forceField(vec2 p){
+  if (uForceType == 1) {            // stretch: drops pulled sideways and flattened → far mountains
+    vec2 d = p - uFC; float fall = exp(-dot(d, d) / (uFR * uFR));
+    return vec2(d.x * uFP.x, -d.y * uFP.y) / uFR * fall * 2.0;
+  } else if (uForceType == 2) {     // horizontal spreading of the re-wetted lower band
+    float band = smoothstep(uFP.x, uFP.y, p.y);
+    return vec2(tanh((p.x - uFC.x) * uFP.z), -0.12) * band;
+  } else if (uForceType == 3) {     // gather: dissolved ink drifts toward the plum-branch line
+    vec2 cp; float dist = lineDist(p, cp);
+    return (cp - p) / max(dist, 1e-4) * smoothstep(0.004, 0.035, dist) * exp(-dist / uFR);
+  } else if (uForceType == 4) {     // vortex: differential rotation + slight inflow → spiral arms
+    vec2 d = p - uFC; float r = length(d) + 1e-4;
+    vec2 tang = vec2(-d.y, d.x) / r;
+    float x = r / uFP.x;
+    float swirl = 2.0 * x / (1.0 + x * x);
+    float fall = exp(-pow(r / uFR, 4.0));
+    return (tang * swirl - d / r * uFP.y * smoothstep(0.02, 0.12, r)) * fall;
+  }
+  return vec2(0.0);
+}
+
+void main(){
+  vec2 uv = vUv;
+  vec2 p = vec2(uv.x * uAspect, 1.0 - uv.y);
+  vec4 C = texture(uWater, uv);
+  float absorb = C.a;
+  vec2 vel = C.gb;
+
+  // 1. semi-Lagrangian advection by the (slow) external velocity field
+  vec2 buv = uv - vel * uTexel;
+  float w = texture(uWater, buv).r;
+  vec3 P = texture(uPig, buv).rgb;
+
+  // 2. water spreads through paper fibres (conservative flux, conductance from absorbency);
+  //    pigment is carried by that water flux (upwind) and diffuses inside wet paper.
+  float dw = 0.0; vec3 dP = vec3(0.0); vec2 g = vec2(0.0);
+  vec3 q = P / max(w, 0.05);
+  for (int i = 0; i < 8; i++) {
+    vec2 nuv = uv + OFF[i] * uTexel;
+    vec4 N = texture(uWater, nuv);
+    vec3 Pn = texture(uPig, nuv).rgb;
+    float wn = N.r;
+    float c = WT[i] * 0.5 * (absorb + N.a);               // fibre-dependent conductance
+    float gate = smoothstep(uRetain, uRetain * 3.0, max(w, wn)); // sized paper resists tiny amounts
+    float F = uWaterDiff * c * gate * (wn - w);           // > 0 : water flows into this cell
+    dw += F;
+    vec3 qn = Pn / max(wn, 0.05);
+    dP += F * (F > 0.0 ? qn : q) * uCarry;                // pigment rides the water
+    float mob = smoothstep(0.02, 0.30, min(w, wn));       // no diffusion across dry paper
+    dP += uPigDiff * c * mob * (Pn - P);
+    g += OFF[i] * WT[i] * wn;
+  }
+  w += dw;
+  P = max(P + dP, 0.0);
+  float edge = length(g) * 0.33;                          // ≈ |∇water| : the drying front
+
+  // 3. evaporation (thin water at the fringe evaporates faster; absorbent fibres drink faster)
+  float wet0 = smoothstep(0.0, 0.5, w);
+  w -= uDry * (0.55 + 0.9 * absorb) * (1.0 + uEdgeEvap * (1.0 - wet0));
+  w = clamp(w, 0.0, 2.0);
+  float wet = smoothstep(0.0, 0.45, w);
+
+  // 4. deposition: slow in pools, fast at the wet→dry edge (dark rim), total when dry
+  vec4 D = texture(uDep, uv);
+  float rate = uDeposit + uEdgeDep * edge * (1.0 - 0.6 * wet) + uDryDep * (1.0 - smoothstep(0.01, 0.2, w));
+  rate *= mix(0.55, 1.5, absorb);                          // fibres catch more pigment
+  if (w < 0.004) rate = 1.0;
+  rate = clamp(rate, 0.0, 1.0);
+  vec3 dep = P * rate;
+  P -= dep; D.rgb += dep;
+
+  // 5. re-wetting dissolves dried pigment back into the water (破墨 / transitions)
+  vec3 lifted = D.rgb * uLift * smoothstep(0.2, 0.8, w);
+  D.rgb -= lifted; P += lifted;
+
+  // 6. dilution: very wet areas thin out (the old image dissolving into water)
+  float dil = uDilute * wet;
+  if (uForceType == 3) { vec2 cp; dil += uFP.z * uFS * wet * smoothstep(0.03, 0.2, lineDist(p, cp)); }
+  P *= 1.0 - clamp(dil, 0.0, 0.5);
+
+  // 7. tide line: a faint stain where a wet front stands and dries
+  D.a = min(1.0, D.a + uStain * 0.02 * edge * (1.0 - wet) * step(0.003, C.r));
+
+  // 8. velocity relaxes toward the external force (only where wet), otherwise decays
+  vec2 target = vec2(0.0);
+  if (uForceType > 0) { vec2 f = forceField(p) * uFS; target = vec2(f.x, -f.y); }
+  vel += (target * wet - vel) * uRelax;
+  vel *= smoothstep(0.0, 0.12, w);
+  float sp = length(vel); if (sp > 2.0) vel *= 2.0 / sp;
+
+  oWater = vec4(w, vel, absorb);
+  oPig = vec4(P, 0.0);
+  oDep = D;
+}`;
+
+/* ============================== BRUSH SYSTEM (GPU) ================== */
+// Instanced splats: brush dabs (mode 0) with procedural bristles / dry-brush breakup,
+// and irregular blobs (mode 1) for drops and washes. Additively blended into state.
+const VS_SPLAT = GLSL_HEAD + `
+layout(location=0) in vec2 aCorner;
+layout(location=1) in vec4 a0; // x, y, angle, radius
+layout(location=2) in vec4 a1; // water, amount, dryness, arc length
+layout(location=3) in vec4 a2; // K1.rgb, seed
+layout(location=4) in vec4 a3; // mode, depositFraction, elongation, shape irregularity
+layout(location=5) in vec4 a4; // K2.rgb (second pigment across the brush), velocity impulse
+uniform float uAspect;
+out vec2 vLocal; out vec2 vPuv;
+flat out vec4 v0; flat out vec4 v1; flat out vec4 v2; flat out vec4 v3; flat out vec4 v4;
+void main(){
+  float r = a0.w, el = a3.z, sh = a3.w;
+  vec2 dir = vec2(cos(a0.z), sin(a0.z)), perp = vec2(-dir.y, dir.x);
+  float ext = r * max(el, 1.0) * (1.0 + sh) * 1.12;
+  vec2 l = aCorner * ext;
+  vec2 world = a0.xy + dir * l.x + perp * l.y;
+  vLocal = l / r;
+  vPuv = vec2(world.x / uAspect, 1.0 - world.y);
+  v0 = a0; v1 = a1; v2 = a2; v3 = a3; v4 = a4;
+  gl_Position = vec4(vPuv * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const FS_SPLAT = GLSL_HEAD + GLSL_NOISE + `
+in vec2 vLocal; in vec2 vPuv;
+flat in vec4 v0; flat in vec4 v1; flat in vec4 v2; flat in vec4 v3; flat in vec4 v4;
+uniform sampler2D uPaper;
+layout(location=0) out vec4 oWater; layout(location=1) out vec4 oPig; layout(location=2) out vec4 oDep;
+void main(){
+  float mode = v3.x, depFrac = v3.y, el = v3.z, sh = v3.w, seed = v2.w;
+  vec2 L = vLocal;
+  float cover, dens = 1.0, mixT;
+  if (mode < 0.5) {
+    // ---- brush dab: elliptical footprint, bristle streaks continuous along the stroke ----
+    float d = length(vec2(L.x / el, L.y));
+    if (d > 1.0) discard;
+    float body = 1.0 - smoothstep(0.62, 1.0, d);
+    float dry = v1.z, r = v0.w;
+    float across = L.y;                              // -1..1 across the brush
+    float s = v1.w + L.x * r;                        // arc length along the stroke (scene units)
+    float b  = vn(vec2(across * 7.0 + seed * 17.0, seed * 3.1));   // bristle clump load
+    float b2 = vn(vec2(across * 21.0 + seed * 5.0, 1.7));          // individual hairs
+    float brk = vn(vec2(across * 11.0 + seed * 9.0, s * 48.0));    // breaks along the stroke
+    float brk2 = vn(vec2(across * 26.0 + seed * 3.0, s * 140.0));
+    float tooth = texture(uPaper, vPuv).a;           // paper grain catches a dry brush
+    float load = 0.40 * b + 0.18 * b2 + 0.30 * brk + 0.12 * brk2
+               - 0.40 * across * across * dry + (tooth - 0.5) * 0.55 * dry;
+    float thr = dry * 0.95 - 0.22;                   // dry → higher threshold → 飞白 gaps
+    float m = smoothstep(thr - 0.05, thr + 0.05, load);
+    cover = body * mix(1.0, m, smoothstep(0.0, 0.12, dry));
+    dens = 0.78 + 0.44 * b2;                          // even a wet brush leaves faint hair streaks
+    mixT = smoothstep(-0.9, 0.9, across);
+  } else {
+    // ---- blob: drop / wash with irregular, noisy outline ----
+    float ang = atan(L.y, L.x);
+    vec2 cs = vec2(cos(ang), sin(ang));
+    float n = vn(cs * 1.4 + seed * 13.0) * 0.65 + vn(cs * 3.7 + seed * 7.0) * 0.35;
+    float rr = 1.0 + sh * (n * 2.0 - 1.0);
+    float d = length(vec2(L.x / el, L.y)) / rr;
+    if (d > 1.0) discard;
+    cover = 1.0 - smoothstep(0.5, 1.0, d);
+    dens = 0.85 + 0.3 * vn(L * 3.0 + seed * 3.0);
+    mixT = smoothstep(0.25, 1.0, d);
+  }
+  vec3 K = mix(v2.rgb, v4.rgb, mixT);
+  vec3 pig = K * v1.y * cover * dens;
+  vec2 dir = vec2(cos(v0.z), -sin(v0.z));            // scene y-down → texture y-up
+  oWater = vec4(v1.x * cover, dir * v4.w * cover, 0.0);
+  oPig = vec4(pig * (1.0 - depFrac), 0.0);
+  oDep = vec4(pig * depFrac, 0.0);
+}`;
+
+/* ============================== TYPOGRAPHY (GPU pass) =============== */
+// Glyph masks (rasterised once) are *deposited* into the simulation over time,
+// top-to-bottom like a brush writing, with some water so the strokes bleed.
+const FS_TEXT = GLSL_HEAD + GLSL_NOISE + `
+in vec2 vUv;
+uniform sampler2D uMask, uPaper;
+uniform vec4 uSel; uniform float uProg, uPrev; uniform vec3 uLay; uniform float uAspect;
+uniform vec3 uK; uniform float uAmt, uWat, uDepFrac; uniform int uSeal;
+layout(location=0) out vec4 oWater; layout(location=1) out vec4 oPig; layout(location=2) out vec4 oDep;
+void main(){
+  vec2 p = vec2(vUv.x * uAspect, 1.0 - vUv.y);
+  float m = dot(texture(uMask, vUv), uSel);
+  if (m < 0.004) discard;
+  float n = vn(p * 38.0) * 0.6 + vn(p * 150.0) * 0.4;
+  float order = (uSeal == 1) ? 0.3 + n * 0.8 : (p.y - uLay.y) / uLay.z + (n - 0.45) * 0.35;
+  float band = 0.32;
+  float inc = smoothstep(order - band, order, uProg) - smoothstep(order - band, order, uPrev);
+  if (inc <= 0.0) discard;
+  float tooth = texture(uPaper, vUv).a;
+  float t = (uSeal == 1)
+      ? smoothstep(0.18, 0.55, tooth * 0.6 + n * 0.7)                     // mottled seal-paste
+      : 0.72 + 0.4 * vn(vec2(p.x * 320.0, p.y * 22.0)) - 0.2 * smoothstep(0.55, 0.8, tooth) * (1.0 - m);
+  float a = m * inc * t;
+  vec3 pig = uK * uAmt * a;
+  oWater = vec4(uWat * a, 0.0, 0.0, 0.0);
+  oPig = vec4(pig * (1.0 - uDepFrac), 0.0);
+  oDep = vec4(pig * uDepFrac, 0.0);
+}`;
+
+/* ============================== RENDER PASS ========================= */
+const FS_RENDER = GLSL_HEAD + `
+in vec2 vUv; out vec4 o;
+uniform sampler2D uWater, uPig, uDep, uPaper;
+uniform vec2 uRes, uSimRes, uPan; uniform float uAspect, uScale, uRot, uPaperReveal, uFade;
+// smoother upscale of the low-res simulation (quintic-weighted bilinear)
+vec4 smoothTex(sampler2D t, vec2 uv){
+  vec2 x = uv * uSimRes + 0.5; vec2 i = floor(x); vec2 f = fract(x);
+  f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  return texture(t, (i + f - 0.5) / uSimRes);
+}
+void main(){
+  vec2 s = gl_FragCoord.xy / uRes;
+  float sa = uRes.x / uRes.y;
+  vec2 uv = s;
+  if (sa > uAspect) uv.y = 0.5 + (s.y - 0.5) * uAspect / sa; else uv.x = 0.5 + (s.x - 0.5) * sa / uAspect;
+  // "breathing scroll": tiny zoom, pan, rotation
+  vec2 q = (uv - 0.5) * vec2(uAspect, 1.0);
+  float c = cos(uRot), si = sin(uRot);
+  q = mat2(c, -si, si, c) * q / uScale;
+  uv = q / vec2(uAspect, 1.0) + 0.5 + uPan;
+
+  vec4 pp = texture(uPaper, uv);
+  vec4 W = texture(uWater, uv);
+  vec3 P = smoothTex(uPig, uv).rgb;
+  vec4 D = smoothTex(uDep, uv);
+
+  // warm rice paper with cloudy formation and faint fibres
+  vec3 paper = vec3(0.957, 0.938, 0.886);
+  paper *= 1.0 + uPaperReveal * ((pp.b - 0.5) * 0.075 + (pp.a - 0.5) * 0.02);
+  paper -= uPaperReveal * pp.g * vec3(0.022, 0.026, 0.036);
+  float wet = smoothstep(0.02, 0.7, W.r);
+  paper *= 1.0 - 0.04 * wet;                           // damp paper is slightly greyer
+
+  // subtractive pigment: Beer–Lambert absorption, with mineral granulation in paper tooth
+  vec3 od = D.rgb + P * 1.05;
+  od *= 0.84 + 0.34 * pp.a;
+  od *= 1.0 - uFade;
+  vec3 col = paper * exp(-od);
+  col *= 1.0 - D.a * 0.06 * (1.0 - uFade) * vec3(0.8, 1.0, 1.25);  // tide-line stain (warm)
+  // barely-there vignette, like an old scroll
+  vec2 v = s - 0.5; col *= 1.0 - 0.07 * dot(v, v);
+  o = vec4(pow(col, vec3(1.0)), 1.0);
+}`;
+
+const progPaper = program(VS_FULL, FS_PAPER);
+const progInit = program(VS_FULL, FS_INIT);
+const progSim = program(VS_FULL, FS_SIM);
+const progSplat = program(VS_SPLAT, FS_SPLAT);
+const progText = program(VS_FULL, FS_TEXT);
+const progRender = program(VS_FULL, FS_RENDER);
+
+// splat geometry: unit quad corners + per-instance attributes (20 floats)
+const FLOATS_PER_DAB = 20;
+const splatVao = gl.createVertexArray();
+gl.bindVertexArray(splatVao);
+const cornerBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const instBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+for (let i = 0; i < 5; i++) {
+  gl.enableVertexAttribArray(1 + i);
+  gl.vertexAttribPointer(1 + i, 4, gl.FLOAT, false, FLOATS_PER_DAB * 4, i * 16);
+  gl.vertexAttribDivisor(1 + i, 1);
+}
+gl.bindVertexArray(null);
+
+// CPU-side dab sink
+const sink = {
+  data: new Float32Array(4096 * FLOATS_PER_DAB), n: 0,
+  dab(x, y, ang, r, water, amount, dry, arc, K1, seed, mode, depFrac, elong, shape, K2, impulse) {
+    if ((this.n + 1) * FLOATS_PER_DAB > this.data.length) {
+      const d = new Float32Array(this.data.length * 2); d.set(this.data); this.data = d;
+    }
+    const o = this.n * FLOATS_PER_DAB, d = this.data;
+    d[o] = x; d[o + 1] = y; d[o + 2] = ang; d[o + 3] = r;
+    d[o + 4] = water; d[o + 5] = amount; d[o + 6] = dry; d[o + 7] = arc;
+    d[o + 8] = K1[0]; d[o + 9] = K1[1]; d[o + 10] = K1[2]; d[o + 11] = seed;
+    d[o + 12] = mode; d[o + 13] = depFrac; d[o + 14] = elong; d[o + 15] = shape;
+    d[o + 16] = K2[0]; d[o + 17] = K2[1]; d[o + 18] = K2[2]; d[o + 19] = impulse;
+    this.n++;
+  },
+};
+
+/* ============================== BRUSH SYSTEM (CPU) ================== */
+// Brush stroke: Catmull–Rom path with per-point pressure. Emits dabs progressively
+// while the brush travels, so strokes are *painted* over time, never faded in.
+const BRUSH_DEFAULT = {
+  pig: 'ink', pig2: null, width: 0.01, water: 0.6, amount: 0.8, dry: 0.0, dryGain: 0.2, dryPress: 0.25,
+  depFrac: 0.12, elong: 0.55, impulse: 0.06, taperIn: 0.08, taperOut: 0.18, pw: CONFIG.brush.pressureWidth,
+};
+class Stroke {
+  constructor(t0, dur, pts, o, seed) {
+    this.t0 = t0; this.dur = dur;
+    this.o = Object.assign({}, BRUSH_DEFAULT, o);
+    this.K1 = mixK(this.o.pig); this.K2 = this.o.pig2 ? mixK(this.o.pig2) : this.K1;
+    this.seed = seed;
+    const P = pts.length === 1 ? [pts[0], [pts[0][0] + 0.001, pts[0][1], pts[0][2]]] : pts;
+    const X = [], Y = [], Pp = [];
+    const get = i => P[clamp(i, 0, P.length - 1)];
+    for (let i = 0; i < P.length - 1; i++) {
+      const p0 = get(i - 1), p1 = get(i), p2 = get(i + 1), p3 = get(i + 2);
+      const n = 14;
+      for (let k = 0; k < n; k++) {
+        const t = k / n, t2 = t * t, t3 = t2 * t;
+        const cr = (a, b, c, d) => 0.5 * ((2 * b) + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+        X.push(cr(p0[0], p1[0], p2[0], p3[0])); Y.push(cr(p0[1], p1[1], p2[1], p3[1]));
+        Pp.push(lerp(p1[2] ?? 1, p2[2] ?? 1, t));
+      }
+    }
+    const last = P[P.length - 1];
+    X.push(last[0]); Y.push(last[1]); Pp.push(last[2] ?? 1);
+    const S = [0];
+    for (let i = 1; i < X.length; i++) S.push(S[i - 1] + Math.hypot(X[i] - X[i - 1], Y[i] - Y[i - 1]));
+    this.X = X; this.Y = Y; this.P = Pp; this.S = S; this.L = Math.max(S[S.length - 1], 1e-5);
+    this.next = 0; this.idx = 0; this.done = false;
+  }
+  at(s) {
+    const S = this.S;
+    while (this.idx < S.length - 2 && S[this.idx + 1] < s) this.idx++;
+    const i = this.idx, seg = Math.max(S[i + 1] - S[i], 1e-9), u = clamp((s - S[i]) / seg, 0, 1);
+    return {
+      x: lerp(this.X[i], this.X[i + 1], u), y: lerp(this.Y[i], this.Y[i + 1], u),
+      a: Math.atan2(this.Y[i + 1] - this.Y[i], this.X[i + 1] - this.X[i]),
+      p: lerp(this.P[i], this.P[i + 1], u),
+    };
+  }
+  emit(t, sink) {
+    if (this.done || t < this.t0) return;
+    const u = clamp((t - this.t0) / this.dur, 0, 1);
+    const e = u >= 1 ? 1 : 0.5 * u + 0.5 * u * u * (3 - 2 * u); // brush accelerates, then eases
+    const head = e * this.L, o = this.o;
+    while (this.next <= head) {
+      const s = this.at(this.next), un = this.next / this.L;
+      // pressure envelope: press in, lift off
+      let p = s.p * Math.min(1, (un + 0.03) / o.taperIn) * Math.pow(Math.min(1, (1 - un + 0.03) / o.taperOut), 0.7);
+      p = clamp(p, 0.1, 1.2);
+      // brush runs dry along the stroke; light pressure breaks the bristles apart
+      const dry = clamp(o.dry + o.dryGain * Math.pow(un, 1.4) + (1 - p) * o.dryPress * (o.dry > 0.05 ? 1 : 0.4), 0, 1);
+      const r = o.width * (1 - o.pw + o.pw * p);
+      const spacing = Math.max(r * CONFIG.brush.spacing, PX * 0.45);
+      const norm = spacing / (2 * r * o.elong * 0.72);
+      sink.dab(s.x, s.y, s.a, r,
+        o.water * norm * (1 - 0.75 * dry), o.amount * norm * (0.55 + 0.45 * Math.min(p, 1)) * (1 - 0.35 * dry),
+        dry, this.next, this.K1, this.seed, 0, o.depFrac, o.elong, 0, this.K2, o.impulse * norm);
+      this.next += spacing;
+    }
+    if (u >= 1) this.done = true;
+  }
+}
+// Single irregular blob (drop core, petal, dot)
+class Blob {
+  constructor(t0, x, y, R, o, seed) {
+    this.t0 = t0; this.x = x; this.y = y; this.R = R; this.seed = seed;
+    this.o = Object.assign({ pig: 'ink', pig2: null, water: 1, amount: 1, depFrac: 0.1, elong: 1, shape: 0.25, angle: 0 }, o);
+    this.K1 = mixK(this.o.pig); this.K2 = this.o.pig2 ? mixK(this.o.pig2) : this.K1;
+    this.done = false;
+  }
+  emit(t, sink) {
+    if (this.done || t < this.t0) return;
+    this.done = true;
+    const o = this.o;
+    sink.dab(this.x, this.y, o.angle, this.R, o.water, o.amount, 0, 0, this.K1, this.seed, 1, o.depFrac, o.elong, o.shape, this.K2, 0);
+  }
+}
+// Continuous wetting over time (re-wetting transitions, drop blooms), radius may grow
+class Wash {
+  constructor(t0, dur, x, y, R0, R1, o, seed) {
+    this.t0 = t0; this.dur = dur; this.x = x; this.y = y; this.R0 = R0; this.R1 = R1; this.seed = seed;
+    this.o = Object.assign({ pig: 'ink', water: 1, amount: 0, depFrac: 0, elong: 1, shape: 0.35, angle: 0 }, o);
+    this.K = mixK(this.o.pig); this.done = false;
+  }
+  emit(t, sink) {
+    if (this.done || t < this.t0) return;
+    const u = (t - this.t0) / this.dur;
+    if (u > 1) { this.done = true; return; }
+    const f = STEP / this.dur, o = this.o;
+    sink.dab(this.x, this.y, o.angle, lerp(this.R0, this.R1, Math.sqrt(u)), o.water * f, o.amount * f, 0, 0,
+      this.K, this.seed, 1, o.depFrac, o.elong, o.shape, this.K, 0);
+  }
+}
+// Text / seal deposition layer
+class TextLayer {
+  constructor(t0, t1, chan, o) { Object.assign(this, { t0, t1, chan }, o); this.K = mixK(o.pig); }
+  prog(t) { return lerp(-0.45, this.n + 0.45, clamp((t - this.t0) / (this.t1 - this.t0), 0, 1)); }
+}
+
+/* ============================== SCENE EVENTS ======================== */
+function buildScene(seed) {
+  const rnd = mulberry32(seed);
+  const R = (a, b) => a + (b - a) * rnd();
+  const ev = [], texts = [];
+  const nextSeed = () => Math.floor(rnd() * 997) + rnd();
+  const stroke = (t, dur, pts, o) => ev.push(new Stroke(t, dur, pts, o, nextSeed()));
+  const blob = (t, x, y, r, o) => ev.push(new Blob(t, x, y, r, o, nextSeed()));
+  const wash = (t, dur, x, y, r0, r1, o) => ev.push(new Wash(t, dur, x, y, r0, r1, o, nextSeed()));
+
+  // ---- ink drop: impact → satellites → bloom fed by spreading water ----
+  function drop(t, x, y, r, pig, amt = 1) {
+    blob(t, x, y, r * 0.7, { pig, water: 1.2, amount: amt * 0.9, shape: 0.32, depFrac: 0.04 });
+    const ns = 2 + Math.floor(rnd() * 3);
+    for (let i = 0; i < ns; i++) {
+      const a = R(0, Math.PI * 2), d = r * R(1.25, 2.3);
+      blob(t + R(0.02, 0.12), x + Math.cos(a) * d, y + Math.sin(a) * d, r * R(0.08, 0.2), { pig, water: 0.8, amount: amt * 0.8, shape: 0.25 });
+    }
+    wash(t + 0.05, 2.4, x, y, r * 0.8, r * 2.25, { pig, water: 1.9, amount: amt * 0.45, shape: 0.5, depFrac: 0.0 });
+  }
+  // ---- mountain: ridge line, graded body sweeps (mist below), optional texture strokes ----
+  const ridgeFn = (peaks, base) => x => base - peaks.reduce((s, [c, h, w]) => s + h * Math.exp(-(((x - c) / w) ** 2)), 0);
+  function mountain(t, x0, x1, f, base, o) {
+    const segs = o.segs || 3, segLen = (x1 - x0) / segs;
+    let tt = t;
+    for (let s = 0; s < segs; s++) {
+      const a = x0 + s * segLen - (s ? 0.02 : 0), b = x0 + (s + 1) * segLen + 0.01;
+      const pts = [];
+      for (let x = a; x <= b + 1e-6; x += 0.035) pts.push([x, f(x) + R(-0.004, 0.004), R(0.6, 1.0)]);
+      stroke(tt, o.ridgeDur / segs, pts, o.ridge);
+      tt += o.ridgeDur / segs * 0.9;
+    }
+    // body sweeps: follow the ridge at increasing depth with thinner ink → fades into mist
+    for (let k = 1; k <= o.layers; k++) {
+      const fr = k / (o.layers + 1);
+      const pts = [];
+      const dirRight = k % 2 === 1;
+      for (let x = x0 + 0.02; x <= x1 - 0.02; x += 0.04) {
+        const y = f(x) + Math.max(0, base - f(x)) * fr * 0.85 + R(-0.006, 0.006);
+        pts.push([x, y, R(0.55, 1.0)]);
+      }
+      if (!dirRight) pts.reverse();
+      stroke(t + o.ridgeDur * 0.55 + k * o.bodyGap, o.bodyDur, pts,
+        Object.assign({}, o.body, { amount: o.body.amount * (1 - fr * 0.7) }));
+    }
+  }
+
+  /* ---------- CHAPTER 1 · 序·滴 (0–22 s) ---------- */
+  drop(3.0, 0.70, 0.43, 0.050, 'ink', 1.0);
+  drop(4.7, 0.845, 0.385, 0.038, 'cinnabar', 0.95);
+  drop(6.2, 0.76, 0.535, 0.043, 'azurite', 1.0);
+  drop(7.6, 0.875, 0.515, 0.040, 'gamboge', 1.05);
+  drop(8.9, 0.585, 0.525, 0.034, 'indigo', 1.0);
+  drop(10.1, 0.615, 0.365, 0.030, 'ochre', 1.0);
+  drop(11.0, 0.955, 0.45, 0.022, 'rouge', 1.0);
+  texts.push(new TextLayer(12.0, 16.6, 0, { pig: 'ink', amt: 1.35, wat: 0.42, depFrac: 0.45, lay: [1.25, 0.235, 0.19], n: 2, seal: 0 }));
+
+  /* ---------- transition: drops stretch & rewet → far mountains ---------- */
+  wash(18.6, 3.0, 0.74, 0.455, 0.16, 0.25, { water: 2.4, elong: 2.0, shape: 0.3 });
+  wash(19.2, 2.6, 0.70, 0.40, 0.08, 0.14, { water: 1.2, elong: 1.6, shape: 0.4 });
+  wash(19.4, 2.6, 0.84, 0.52, 0.08, 0.14, { water: 1.2, elong: 1.6, shape: 0.4 });
+  wash(20.0, 3.0, 1.25, 0.43, 0.12, 0.23, { water: 2.4, elong: 0.55, shape: 0.35 });
+
+  /* ---------- CHAPTER 2 · 山 (22–58 s) ---------- */
+  const farF = ridgeFn([[0.30, 0.09, 0.10], [0.62, 0.075, 0.09], [0.95, 0.12, 0.10], [1.24, 0.07, 0.08], [1.50, 0.045, 0.07]], 0.47);
+  mountain(25.2, 0.04, 1.58, farF, 0.52, {
+    segs: 3, ridgeDur: 5.0, layers: 4, bodyGap: 0.7, bodyDur: 2.4,
+    ridge: { pig: { ink: 0.45, indigo: 0.5 }, width: 0.011, water: 0.95, amount: 0.34, dry: 0, dryGain: 0.1, depFrac: 0.05 },
+    body: { pig: { ink: 0.35, indigo: 0.55 }, width: 0.045, water: 1.1, amount: 0.17, dryGain: 0.05, depFrac: 0.02 },
+  });
+  // distant moss dots on far ridge
+  for (let i = 0; i < 16; i++) {
+    const x = R(0.18, 1.35), y = farF(x) + R(-0.002, 0.006);
+    stroke(30.4 + i * 0.08, 0.06, [[x, y, 1], [x + 0.004, y + 0.001, 0.8]], { pig: { ink: 0.8, indigo: 0.3 }, width: 0.0028, water: 0.4, amount: 0.7 });
+  }
+  const midF = ridgeFn([[0.12, 0.22, 0.10], [0.36, 0.16, 0.10], [0.62, 0.09, 0.09], [0.90, 0.045, 0.08]], 0.66);
+  mountain(32.2, 0.0, 1.08, midF, 0.68, {
+    segs: 2, ridgeDur: 4.4, layers: 4, bodyGap: 0.6, bodyDur: 2.2,
+    ridge: { pig: { ink: 0.7, ochre: 0.35 }, width: 0.012, water: 0.6, amount: 0.7, dry: 0.12, dryGain: 0.35, depFrac: 0.2 },
+    body: { pig: { ink: 0.45, ochre: 0.5 }, width: 0.045, water: 1.0, amount: 0.26, dryGain: 0.1, depFrac: 0.03 },
+  });
+  // 披麻皴: hemp-fibre texture strokes down the slopes
+  for (let i = 0; i < 9; i++) {
+    const x = R(0.05, 0.85), y = midF(x) + 0.01;
+    const len = R(0.05, 0.1), sgn = x < 0.36 ? -1 : 1;
+    stroke(36.8 + i * 0.28, 0.5, [[x, y, 0.6], [x + sgn * len * 0.25, y + len * 0.5, 1], [x + sgn * len * 0.4, y + len, 0.5]],
+      { pig: { ink: 0.8, ochre: 0.2 }, width: 0.0055, water: 0.3, amount: 0.65, dry: 0.4, dryGain: 0.4, depFrac: 0.5 });
+  }
+  const nearF = ridgeFn([[1.00, 0.10, 0.07], [1.19, 0.30, 0.09], [1.43, 0.24, 0.08], [1.60, 0.16, 0.06]], 1.0);
+  mountain(40.2, 0.86, 1.62, nearF, 1.02, {
+    segs: 2, ridgeDur: 3.6, layers: 3, bodyGap: 0.6, bodyDur: 2.0,
+    ridge: { pig: 'ink', width: 0.014, water: 0.35, amount: 1.1, dry: 0.34, dryGain: 0.45, dryPress: 0.4, depFrac: 0.55 },
+    body: { pig: { ochre: 0.75, ink: 0.15 }, width: 0.045, water: 1.0, amount: 0.26, dryGain: 0.05, depFrac: 0.05 },
+  });
+  // 斧劈皴: axe-cut dry-brush strokes on the near rocks
+  for (let i = 0; i < 11; i++) {
+    const x = R(0.95, 1.55), y = nearF(x) + R(0.02, 0.12);
+    const l = R(0.04, 0.08);
+    stroke(44.0 + i * 0.22, 0.35, [[x, y, 1], [x - l * 0.55, y + l, 0.5]],
+      { pig: 'ink', width: R(0.012, 0.02), water: 0.15, amount: 0.95, dry: 0.55, dryGain: 0.4, dryPress: 0.5, depFrac: 0.8, elong: 0.45 });
+  }
+  // 石绿 accent on the near peaks (青绿 touch)
+  stroke(46.4, 1.2, [[1.08, nearF(1.08) + 0.03, 0.8], [1.19, nearF(1.19) + 0.035, 1], [1.30, nearF(1.30) + 0.04, 0.7]],
+    { pig: { malachite: 0.8, azurite: 0.2 }, width: 0.02, water: 0.8, amount: 0.3, depFrac: 0.05 });
+  stroke(46.9, 0.9, [[1.36, nearF(1.36) + 0.03, 0.8], [1.45, nearF(1.45) + 0.03, 1], [1.53, nearF(1.53) + 0.04, 0.6]],
+    { pig: { malachite: 0.9 }, width: 0.018, water: 0.8, amount: 0.26, depFrac: 0.05 });
+  // low bank bottom-left
+  stroke(45.0, 1.4, [[0.0, 0.93, 0.8], [0.14, 0.915, 1], [0.30, 0.935, 0.8], [0.44, 0.965, 0.4]],
+    { pig: { ink: 0.85, ochre: 0.2 }, width: 0.012, water: 0.3, amount: 0.9, dry: 0.4, dryGain: 0.4, depFrac: 0.5 });
+  stroke(45.8, 1.4, [[0.02, 0.965, 0.8], [0.2, 0.955, 1], [0.38, 0.985, 0.6]],
+    { pig: { ochre: 0.8, ink: 0.2 }, width: 0.026, water: 0.85, amount: 0.25 });
+  // trees: trunk + clustered leaf dots (点叶)
+  function tree(t, x, y, h, dotR, pig) {
+    stroke(t, 0.35, [[x, y, 1], [x + R(-0.006, 0.006), y - h * 0.5, 0.8], [x + R(-0.008, 0.008), y - h, 0.4]],
+      { pig: 'ink', width: dotR * 0.45, water: 0.2, amount: 1.1, dry: 0.3, dryGain: 0.3, depFrac: 0.5 });
+    const n = 10 + Math.floor(rnd() * 6);
+    for (let i = 0; i < n; i++) {
+      const a = R(0, Math.PI * 2), d = R(0, h * 0.45);
+      const cx = x + Math.cos(a) * d, cy = y - h * 0.85 + Math.sin(a) * d * 0.6;
+      stroke(t + 0.3 + i * 0.05, 0.05, [[cx, cy, 1], [cx + dotR * 0.8, cy + dotR * 0.2, 0.8]],
+        { pig, width: dotR, water: 0.35, amount: R(0.8, 1.2), dry: 0.2, dryGain: 0.2, depFrac: 0.3, taperIn: 0.3 });
+    }
+  }
+  tree(47.0, 1.13, nearF(1.13) + 0.012, 0.055, 0.0055, { ink: 0.9, malachite: 0.2 });
+  tree(47.7, 1.19, nearF(1.19) + 0.008, 0.07, 0.006, 'ink');
+  tree(48.4, 1.26, nearF(1.26) + 0.012, 0.05, 0.005, { ink: 0.7, malachite: 0.45 });
+  tree(49.0, 0.34, midF(0.34) + 0.006, 0.035, 0.0038, { ink: 0.8, indigo: 0.2 });
+  tree(49.4, 0.40, midF(0.40) + 0.006, 0.03, 0.0035, 'ink');
+  tree(49.8, 0.45, midF(0.45) + 0.008, 0.026, 0.0032, { ink: 0.8, malachite: 0.3 });
+  // red sun (朱砂)
+  blob(50.2, 0.30, 0.20, 0.036, { pig: { cinnabar: 1.0, rouge: 0.12 }, water: 0.55, amount: 0.8, shape: 0.05, depFrac: 0.2 });
+  wash(50.3, 1.2, 0.30, 0.20, 0.036, 0.043, { pig: 'cinnabar', water: 0.3, amount: 0.12, shape: 0.06 });
+  // birds: two strokes each
+  [[0.52, 0.245, 0.012], [0.575, 0.215, 0.010], [0.555, 0.285, 0.009], [0.63, 0.255, 0.011], [0.68, 0.225, 0.008]].forEach(([x, y, s], i) => {
+    const t = 51.6 + i * 0.45;
+    stroke(t, 0.16, [[x - s, y - s * 0.35, 0.4], [x - s * 0.45, y - s * 0.5, 1], [x, y, 0.6]], { width: 0.0024, water: 0.2, amount: 1.1, taperIn: 0.3, depFrac: 0.4 });
+    stroke(t + 0.16, 0.16, [[x, y, 0.6], [x + s * 0.5, y - s * 0.55, 1], [x + s * 1.1, y - s * 0.25, 0.35]], { width: 0.0024, water: 0.2, amount: 1.1, depFrac: 0.4 });
+  });
+  // tiny boat with fisherman, pole and ripples
+  stroke(54.2, 0.5, [[0.585, 0.752, 0.5], [0.61, 0.764, 1], [0.64, 0.762, 1], [0.662, 0.748, 0.4]], { width: 0.0036, water: 0.25, amount: 1.25, dry: 0.12, depFrac: 0.45 });
+  stroke(54.8, 0.2, [[0.618, 0.756, 1], [0.620, 0.742, 0.8]], { width: 0.0028, water: 0.2, amount: 1.2, depFrac: 0.5 });
+  blob(55.0, 0.6205, 0.7385, 0.0028, { water: 0.2, amount: 1.1, shape: 0.1, depFrac: 0.5 });
+  stroke(55.2, 0.4, [[0.626, 0.733, 0.6], [0.645, 0.788, 0.3]], { width: 0.0013, water: 0.15, amount: 1.0, depFrac: 0.5 });
+  stroke(55.8, 0.9, [[0.545, 0.776, 0.3], [0.62, 0.779, 0.7], [0.70, 0.775, 0.3]], { pig: { ink: 0.6, indigo: 0.3 }, width: 0.0018, water: 0.5, amount: 0.35 });
+  stroke(56.4, 0.8, [[0.575, 0.789, 0.3], [0.64, 0.791, 0.6], [0.68, 0.788, 0.3]], { pig: { ink: 0.6, indigo: 0.3 }, width: 0.0015, water: 0.5, amount: 0.25 });
+
+  /* ---------- transition: re-wet from the bottom, spread sideways → 荷 ---------- */
+  const rows = [[0.88, [0.18, 0.55, 0.92, 1.30, 1.55]], [0.64, [0.10, 0.45, 0.80, 1.15, 1.48]], [0.40, [0.25, 0.65, 1.05, 1.42]], [0.18, [0.3, 0.8, 1.3]]];
+  rows.forEach(([y, xs], ri) => xs.forEach((x, i) => wash(56.9 + ri * 0.9 + i * 0.12 + R(0, 0.2), 2.2, x + R(-0.03, 0.03), y, 0.14, 0.26,
+    { water: ri === 3 ? 1.3 : 2.3, elong: 1.5, shape: 0.35 })));
+
+  /* ---------- CHAPTER 3 · 荷 (58–88 s) ---------- */
+  function leaf(t, cx, cy, rx, ry, rot, pigs, n) {
+    const cr = Math.cos(rot), sr = Math.sin(rot);
+    const P = (u, v) => [cx + u * cr - v * sr, cy + u * sr + v * cr];
+    const angs = [];
+    for (let k = 0; k < n; k++) {
+      const th = (k / n) * Math.PI * 2 + R(-0.12, 0.12);
+      angs.push(th);
+      const f = R(0.86, 1.04);
+      const [ex, ey] = P(Math.cos(th) * rx * f, Math.sin(th) * ry * f);
+      const [mx, my] = P(Math.cos(th + 0.08) * rx * f * 0.55, Math.sin(th + 0.08) * ry * f * 0.55);
+      const [sx, sy] = P(Math.cos(th) * rx * 0.08, Math.sin(th) * ry * 0.08);
+      stroke(t + k * 0.2, 0.42, [[sx, sy, 0.7], [mx, my, 1.1], [ex, ey, 0.75]],
+        { pig: pigs[k % pigs.length], pig2: { ink: 1.0, indigo: 0.25 }, width: Math.max(rx, ry) * 0.22, water: 1.05, amount: R(0.3, 0.48),
+          dry: 0, dryGain: 0.18, depFrac: 0.03, elong: 0.6, taperIn: 0.1, taperOut: 0.12 });
+    }
+    // dark heart of the leaf
+    blob(t + n * 0.2 + 0.2, cx, cy, Math.min(rx, ry) * 0.12, { pig: 'ink', water: 0.5, amount: 0.9, shape: 0.3 });
+    return { cx, cy, rx, ry, angs, P };
+  }
+  function veins(t, L) {
+    L.angs.forEach((th, k) => {
+      if (k % 1 !== 0) return;
+      const [ex, ey] = L.P(Math.cos(th) * L.rx * 0.84, Math.sin(th) * L.ry * 0.84);
+      const [mx, my] = L.P(Math.cos(th - 0.05) * L.rx * 0.45, Math.sin(th - 0.05) * L.ry * 0.45);
+      stroke(t + k * 0.14, 0.3, [[L.cx, L.cy, 1], [mx, my, 0.9], [ex, ey, 0.4]],
+        { pig: { ink: 1.0, indigo: 0.15 }, width: 0.0019, water: 0.12, amount: 1.1, dry: 0.3, dryGain: 0.55, dryPress: 0.4, depFrac: 0.6 });
+    });
+  }
+  function stem(t, x0, y0, x1, bend, w) {
+    const pts = [[x0, y0, 0.9], [lerp(x0, x1, 0.4) + bend, lerp(y0, 1.05, 0.4), 1], [lerp(x0, x1, 0.75) + bend * 0.6, lerp(y0, 1.05, 0.75), 1], [x1, 1.06, 0.9]];
+    stroke(t, 1.5, pts, { pig: { ink: 0.75, ochre: 0.3, malachite: 0.15 }, width: w, water: 0.3, amount: 0.95, dry: 0.18, dryGain: 0.3, depFrac: 0.35, taperIn: 0.03, taperOut: 0.02 });
+    for (let i = 0; i < 6; i++) { // prickle dots along the stem
+      const u = R(0.15, 0.9), x = lerp(x0, x1, u) + bend * Math.sin(u * Math.PI) * 0.9 + (i % 2 ? 1 : -1) * w * 1.3, y = lerp(y0, 1.05, u);
+      stroke(t + 1.5 + i * 0.07, 0.05, [[x, y, 1], [x + 0.002, y + 0.002, 0.6]], { width: w * 0.55, water: 0.2, amount: 1.1, depFrac: 0.5 });
+    }
+  }
+  const leafPig = [
+    [{ ink: 0.7, indigo: 0.35 }, { ink: 0.55, indigo: 0.3, malachite: 0.25 }, { ink: 0.8, indigo: 0.2 }],
+    [{ indigo: 0.6, malachite: 0.45, ink: 0.25 }, { ink: 0.5, indigo: 0.5 }, { indigo: 0.5, malachite: 0.35, gamboge: 0.15, ink: 0.2 }],
+    [{ malachite: 0.6, gamboge: 0.25, indigo: 0.3 }, { malachite: 0.55, indigo: 0.4, ink: 0.1 }],
+  ];
+  const L1 = leaf(63.0, 0.48, 0.66, 0.21, 0.105, -0.06, leafPig[0], 12);
+  const L2 = leaf(65.2, 0.99, 0.80, 0.22, 0.095, 0.05, leafPig[1], 12);
+  const L3 = leaf(67.2, 1.33, 0.57, 0.12, 0.075, -0.35, leafPig[2], 9);
+  const L4 = leaf(68.4, 0.14, 0.87, 0.14, 0.065, 0.1, leafPig[0], 9);
+  const L5 = leaf(69.6, 0.72, 0.50, 0.075, 0.045, 0.3, leafPig[2], 7);
+  stem(70.3, 0.48, 0.67, 0.53, 0.02, 0.0042);
+  stem(70.8, 0.99, 0.81, 0.95, -0.015, 0.0042);
+  stem(71.3, 1.33, 0.58, 1.26, 0.02, 0.0036);
+  stem(71.7, 0.72, 0.51, 0.68, 0.015, 0.0032);
+  veins(72.8, L1); veins(74.1, L2); veins(75.2, L3); veins(76.0, L4);
+  // lotus flower: pale 胭脂 petals, darker tips, 藤黄 stamens, 石绿 seed pod
+  const FB = [0.80, 0.365];
+  stem(73.8, 0.80, 0.375, 0.86, 0.02, 0.0036);
+  const petals = [[-52, 0.082, 0.030], [52, 0.08, 0.029], [-18, 0.094, 0.031], [20, 0.09, 0.030], [-86, 0.058, 0.026], [86, 0.056, 0.026], [-4, 0.05, 0.033]];
+  petals.forEach(([deg, len, w], i) => {
+    const a = (deg - 90) * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+    const tipx = FB[0] + ca * len, tipy = FB[1] + sa * len;
+    const bx = FB[0] + ca * 0.008, by = FB[1] + sa * 0.008;
+    const bulge = (deg >= 0 ? 1 : -1) * 0.012;
+    const t = 75.2 + i * 0.5;
+    stroke(t, 0.55, [[bx, by, 0.55], [lerp(bx, tipx, 0.5) - sa * bulge, lerp(by, tipy, 0.5) + ca * bulge, 1.1], [tipx, tipy, 0.55]],
+      { pig: { rouge: 0.45, cinnabar: 0.12 }, pig2: { rouge: 0.8 }, width: w, water: 0.85, amount: 0.38, dryGain: 0.05, depFrac: 0.04, elong: 0.6, taperIn: 0.15, taperOut: 0.2 });
+    blob(t + 0.5, lerp(bx, tipx, 0.88), lerp(by, tipy, 0.88), w * 0.33, { pig: { rouge: 0.9, cinnabar: 0.1 }, water: 0.45, amount: 0.55, shape: 0.25 });
+  });
+  blob(79.0, FB[0], FB[1] - 0.018, 0.012, { pig: { malachite: 0.6, gamboge: 0.5 }, water: 0.35, amount: 0.55, shape: 0.15, depFrac: 0.3 });
+  for (let i = 0; i < 12; i++) {
+    const a = R(-Math.PI, 0), d = R(0.012, 0.024), x = FB[0] + Math.cos(a) * d, y = FB[1] - 0.012 + Math.sin(a) * d * 0.6;
+    stroke(79.3 + i * 0.05, 0.05, [[x, y, 1], [x + 0.001, y - 0.002, 0.7]], { pig: i % 3 ? 'gamboge' : { gamboge: 0.6, cinnabar: 0.4 }, width: 0.0026, water: 0.2, amount: 1.0, depFrac: 0.5 });
+  }
+  // bud
+  stem(79.8, 1.13, 0.335, 1.07, -0.02, 0.0033);
+  stroke(80.2, 0.5, [[1.126, 0.338, 0.6], [1.113, 0.30, 1.1], [1.128, 0.258, 0.4]], { pig: { rouge: 0.45, cinnabar: 0.1 }, pig2: { rouge: 0.75 }, width: 0.013, water: 0.75, amount: 0.4, elong: 0.6 });
+  stroke(80.7, 0.5, [[1.136, 0.338, 0.6], [1.146, 0.30, 1.1], [1.13, 0.258, 0.4]], { pig: { rouge: 0.5 }, pig2: { rouge: 0.4, cinnabar: 0.1 }, width: 0.013, water: 0.75, amount: 0.4, elong: 0.6 });
+  blob(81.3, 1.129, 0.266, 0.007, { pig: { rouge: 1.0 }, water: 0.4, amount: 0.8, shape: 0.2 });
+
+  /* ---------- transition: leaves dissolve, dark ink gathers to a diagonal ---------- */
+  [[0.90, [0.15, 0.5, 0.85, 1.2, 1.5]], [0.64, [0.1, 0.42, 0.78, 1.12, 1.45]], [0.40, [0.25, 0.6, 0.95, 1.3]], [0.17, [0.3, 0.7, 1.1]]].forEach(([y, xs], ri) =>
+    xs.forEach((x, i) => wash(85.9 + ri * 0.7 + i * 0.12 + R(0, 0.2), 2.4, x + R(-0.03, 0.03), y, 0.15, 0.26, { water: 2.3, elong: 1.4, shape: 0.35 })));
+
+  /* ---------- CHAPTER 4 · 梅 (88–120 s) ---------- */
+  const branchA = [[0.07, 1.04, 1.0], [0.19, 0.905, 1.0], [0.30, 0.80, 0.85], [0.36, 0.765, 0.7], [0.42, 0.72, 0.95], [0.52, 0.665, 0.8], [0.62, 0.585, 0.75]];
+  const branchB = [[0.60, 0.60, 0.85], [0.68, 0.51, 0.8], [0.745, 0.482, 0.65], [0.92, 0.40, 0.75], [1.02, 0.33, 0.55], [1.10, 0.265, 0.6], [1.20, 0.212, 0.4], [1.31, 0.17, 0.25]];
+  stroke(92.4, 2.8, branchA, { pig: { ink: 0.95, ochre: 0.15 }, width: 0.027, water: 0.22, amount: 1.35, dry: 0.42, dryGain: 0.45, dryPress: 0.45, depFrac: 0.6, elong: 0.5, taperIn: 0.04, taperOut: 0.08 });
+  stroke(95.5, 2.4, branchB, { pig: { ink: 0.95, ochre: 0.12 }, width: 0.017, water: 0.2, amount: 1.3, dry: 0.38, dryGain: 0.5, dryPress: 0.5, depFrac: 0.6, elong: 0.5, taperIn: 0.05, taperOut: 0.3 });
+  const twigs = [
+    [[0.42, 0.72, 0.9], [0.50, 0.80, 0.8], [0.60, 0.86, 0.6], [0.69, 0.885, 0.3]],
+    [[0.70, 0.50, 0.9], [0.73, 0.42, 0.75], [0.722, 0.33, 0.55], [0.685, 0.25, 0.3]],
+    [[0.92, 0.40, 0.9], [1.02, 0.45, 0.7], [1.12, 0.47, 0.5], [1.23, 0.455, 0.25]],
+    [[1.10, 0.265, 0.9], [1.14, 0.18, 0.6], [1.16, 0.105, 0.3]],
+    [[0.30, 0.80, 0.9], [0.25, 0.72, 0.7], [0.225, 0.63, 0.5], [0.225, 0.555, 0.25]],
+    [[0.62, 0.585, 0.9], [0.72, 0.618, 0.6], [0.83, 0.628, 0.3]],
+  ];
+  twigs.forEach((tw, i) => stroke(98.2 + i * 0.35, 0.75, tw,
+    { pig: { ink: 0.95, ochre: 0.15 }, width: 0.0075, water: 0.18, amount: 1.25, dry: 0.34, dryGain: 0.55, dryPress: 0.5, depFrac: 0.6, taperIn: 0.05, taperOut: 0.35 }));
+  // 苔点 dark moss dots at the knots
+  [[0.30, 0.80], [0.42, 0.72], [0.62, 0.585], [0.745, 0.48], [0.92, 0.40], [1.10, 0.265], [0.2, 0.9], [0.52, 0.66]].forEach(([x, y], i) => {
+    const ox = R(-0.012, 0.012), oy = R(-0.012, 0.004);
+    stroke(100.4 + i * 0.1, 0.06, [[x + ox, y + oy, 1], [x + ox + 0.003, y + oy + 0.002, 0.8]], { pig: 'ink', width: 0.0045, water: 0.3, amount: 1.5, depFrac: 0.4 });
+  });
+  // 17 plum blossoms: bud / half-open / fully open, opening one after another
+  const BLOOMS = [
+    [0.23, 0.57, 0.018, 'bud'], [0.26, 0.70, 0.022, 'full'], [0.345, 0.755, 0.02, 'half'], [0.49, 0.79, 0.024, 'full'],
+    [0.62, 0.855, 0.02, 'half'], [0.69, 0.89, 0.014, 'bud'], [0.565, 0.62, 0.022, 'full'], [0.735, 0.61, 0.023, 'full'],
+    [0.835, 0.627, 0.015, 'bud'], [0.72, 0.40, 0.022, 'full'], [0.692, 0.268, 0.018, 'half'], [0.86, 0.43, 0.02, 'full'],
+    [1.035, 0.44, 0.024, 'full'], [1.14, 0.475, 0.018, 'half'], [1.235, 0.452, 0.013, 'bud'], [1.152, 0.135, 0.02, 'half'],
+    [1.245, 0.198, 0.022, 'full'],
+  ];
+  const plumPig = [{ cinnabar: 0.85 }, { rouge: 0.8 }, { rouge: 0.45, cinnabar: 0.35 }];
+  BLOOMS.forEach(([x, y, r, state], i) => {
+    const t = 100.8 + i * 0.78, pig = plumPig[i % 3], a0 = R(0, Math.PI * 2);
+    r *= 1.35;
+    if (state === 'bud') {
+      blob(t, x, y, r * 0.45, { pig: { rouge: 1.0, cinnabar: 0.2 }, water: 0.35, amount: 0.85, shape: 0.15 });
+      blob(t + 0.3, x + Math.cos(a0) * r * 0.35, y + Math.sin(a0) * r * 0.35, r * 0.2, { pig: 'ink', water: 0.2, amount: 1.1, shape: 0.2, depFrac: 0.4 });
+      return;
+    }
+    const np = state === 'full' ? 5 : 3, spread = state === 'full' ? Math.PI * 2 / 5 : 0.75;
+    for (let k = 0; k < np; k++) {
+      const a = a0 + (state === 'full' ? k * spread : (k - 1) * spread) + R(-0.12, 0.12);
+      const d = r * (state === 'full' ? 0.55 : 0.42), pr = r * R(0.47, 0.56) * (state === 'full' ? 1 : 0.85);
+      blob(t + k * 0.1, x + Math.cos(a) * d, y + Math.sin(a) * d, pr, { pig, water: 0.55, amount: 0.42, shape: 0.12, depFrac: 0.08 });
+    }
+    if (state === 'full') {
+      blob(t + 0.55, x, y, r * 0.14, { pig: { gamboge: 0.8, malachite: 0.3 }, water: 0.2, amount: 0.8, shape: 0.2, depFrac: 0.5 });
+      for (let k = 0; k < 7; k++) {
+        const a = R(0, Math.PI * 2), l = r * R(0.45, 0.75), ex = x + Math.cos(a) * l, ey = y + Math.sin(a) * l;
+        stroke(t + 0.65 + k * 0.04, 0.08, [[x + Math.cos(a) * r * 0.12, y + Math.sin(a) * r * 0.12, 0.8], [ex, ey, 0.6]], { pig: 'ink', width: 0.0011, water: 0.08, amount: 1.2, depFrac: 0.7 });
+        blob(t + 0.72 + k * 0.04, ex, ey, 0.0021, { pig: k % 3 ? 'ink' : 'gamboge', water: 0.1, amount: 1.3, shape: 0.1, depFrac: 0.7 });
+      }
+    } else {
+      const ca = a0 + Math.PI;
+      blob(t + 0.4, x + Math.cos(ca) * r * 0.35, y + Math.sin(ca) * r * 0.35, r * 0.24, { pig: { ink: 0.7, rouge: 0.5 }, water: 0.2, amount: 1.0, shape: 0.25, depFrac: 0.4 });
+    }
+  });
+
+  /* ---------- transition: everything re-wets, dissolves toward the centre ---------- */
+  [[0.90, [0.12, 0.45, 0.8, 1.15, 1.48]], [0.64, [0.2, 0.55, 0.9, 1.25]], [0.40, [0.3, 0.65, 1.0, 1.35]], [0.16, [0.45, 0.85, 1.25]]].forEach(([y, xs], ri) =>
+    xs.forEach((x, i) => wash(118.3 + ri * 0.6 + i * 0.12 + R(0, 0.2), 2.4, x + R(-0.03, 0.03), y, 0.15, 0.26, { water: 2.3, elong: 1.3, shape: 0.35 })));
+
+  /* ---------- CHAPTER 5 · 流 (120–150 s) : eight-colour vortex ---------- */
+  const VC = [0.80, 0.50];
+  // keep the vortex wet while it turns
+  for (let i = 0; i < 11; i++) {
+    const a = R(0, Math.PI * 2), d = R(0, 0.26);
+    wash(121.5 + i * 1.1, 1.2, VC[0] + Math.cos(a) * d, VC[1] + Math.sin(a) * d * 0.9, 0.12, 0.16, { water: 0.42, shape: 0.35 });
+  }
+  const ALL = ['ink', 'cinnabar', 'rouge', 'azurite', 'malachite', 'gamboge', 'indigo', 'ochre'];
+  ALL.forEach((pig, k) => {
+    const t = 122.2 + k * 0.95, a = k * Math.PI / 4 + 0.35, rad = 0.25 + R(-0.02, 0.02);
+    const x = VC[0] + Math.cos(a) * rad, y = VC[1] + Math.sin(a) * rad * 0.92;
+    drop(t, x, y, 0.055, pig, pig === 'ink' ? 0.7 : 1.25);
+    // a swept tail following the future flow direction
+    const pts = [];
+    for (let j = 0; j <= 4; j++) { const aa = a + j * 0.09, rr = rad * (1 - j * 0.03); pts.push([VC[0] + Math.cos(aa) * rr, VC[1] + Math.sin(aa) * rr * 0.92, 1 - j * 0.15]); }
+    stroke(t + 0.5, 0.9, pts, { pig, width: 0.02, water: 1.0, amount: 0.7, depFrac: 0.02 });
+  });
+  texts.push(new TextLayer(140.6, 144.6, 1, { pig: 'ink', amt: 1.3, wat: 0.3, depFrac: 0.55, lay: [1.40, 0.165, 0.118], n: 4, seal: 0 }));
+  texts.push(new TextLayer(145.3, 146.0, 2, { pig: { cinnabar: 1.0, rouge: 0.08 }, amt: 1.45, wat: 0.04, depFrac: 0.95, lay: [1.4, 0.66, 0.08], n: 1, seal: 1 }));
+
+  ev.sort((a, b) => a.t0 - b.t0);
+  return { events: ev, texts };
+}
+
+/* ============================== TYPOGRAPHY (glyph masks) ============ */
+const FONT_STACK = "'Ma Shan Zheng', KaiTi, STKaiti, 'Kaiti SC', 'KaiTi_GB2312', serif";
+function buildMasks() {
+  const W = PAPER_W, H = PAPER_H;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const X = x => x / A * W, Yp = y => y * H;
+  function vertical(str, x, y0, size, pitch, color) {
+    ctx.fillStyle = color;
+    ctx.font = `${Math.round(size * H)}px ${FONT_STACK}`;
+    [...str].forEach((ch, i) => ctx.fillText(ch, X(x), Yp(y0 + pitch * i + pitch * 0.5)));
+  }
+  vertical('彩墨', 1.25, 0.235, 0.165, 0.19, 'rgb(255,0,0)');   // title (R)
+  vertical('墨分五色', 1.40, 0.165, 0.1, 0.118, 'rgb(0,255,0)'); // inscription (G)
+  // seal (B): 白文 square seal "彩墨之印", carved characters left white
+  const sc = document.createElement('canvas'); sc.width = W; sc.height = H;
+  const s = sc.getContext('2d');
+  const S = 0.064 * H, cx = X(1.40), cy = Yp(0.665);
+  s.fillStyle = 'rgb(0,0,255)';
+  s.beginPath();
+  const rr = mulberry32(99);
+  for (let i = 0; i < 40; i++) { // slightly irregular border like worn stone
+    const side = Math.floor(i / 10), u = (i % 10) / 10, j = (rr() - 0.5) * S * 0.035;
+    const pts = [[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]];
+    const px = lerp(pts[side][0], pts[side + 1][0], u) * S / 2 + j, py = lerp(pts[side][1], pts[side + 1][1], u) * S / 2 + j;
+    i ? s.lineTo(cx + px, cy + py) : s.moveTo(cx + px, cy + py);
+  }
+  s.closePath(); s.fill();
+  s.globalCompositeOperation = 'destination-out';
+  s.textAlign = 'center'; s.textBaseline = 'middle';
+  s.font = `${Math.round(S * 0.44)}px ${FONT_STACK}`;
+  s.fillStyle = '#000';
+  s.fillText('彩', cx + S * 0.21, cy - S * 0.2); s.fillText('墨', cx + S * 0.21, cy + S * 0.22);
+  s.fillText('之', cx - S * 0.21, cy - S * 0.2); s.fillText('印', cx - S * 0.21, cy + S * 0.22);
+  ctx.drawImage(sc, 0, 0);
+  gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+}
+
+/* ============================== SIM DRIVER ========================== */
+let scene, simTime = 0, stepCount = 0;
+function bindTex(unit, t) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); }
+
+function makePaper(seed) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, paperFb);
+  gl.viewport(0, 0, PAPER_W, PAPER_H);
+  gl.useProgram(progPaper);
+  gl.uniform1ui(progPaper.u('uSeed'), (seed >>> 0) % 100000);
+  gl.uniform1f(progPaper.u('uAspect'), A);
+  gl.uniform1f(progPaper.u('uFibreAngle'), (mulberry32(seed + 5)() - 0.5) * 0.6);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+function resetSim() {
+  scene = buildScene(CONFIG.seed);
+  simTime = 0; stepCount = 0;
+  makePaper(CONFIG.seed);
+  gl.useProgram(progInit);
+  bindTex(3, paperTex); gl.uniform1i(progInit.u('uPaper'), 3);
+  gl.viewport(0, 0, SIM_W, SIM_H);
+  for (const s of [cur, nxt]) { gl.bindFramebuffer(gl.FRAMEBUFFER, s.fb); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+}
+
+function simStep() {
+  const t = simTime;
+  gl.viewport(0, 0, SIM_W, SIM_H);
+
+  // --- 1. brush / drop / wash splats into the current state ---
+  sink.n = 0;
+  for (const e of scene.events) { if (e.t0 > t) break; if (!e.done) e.emit(t, sink); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, cur.fb);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.blendEquation(gl.FUNC_ADD);
+  if (sink.n > 0) {
+    gl.useProgram(progSplat);
+    gl.uniform1f(progSplat.u('uAspect'), A);
+    bindTex(3, paperTex); gl.uniform1i(progSplat.u('uPaper'), 3);
+    gl.bindVertexArray(splatVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, sink.data.subarray(0, sink.n * FLOATS_PER_DAB), gl.DYNAMIC_DRAW);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, sink.n);
+    gl.bindVertexArray(null);
+  }
+  // --- 2. calligraphy / seal deposition ---
+  for (const tx of scene.texts) {
+    if (t < tx.t0 || t > tx.t1 + STEP) continue;
+    gl.useProgram(progText);
+    bindTex(3, paperTex); bindTex(4, maskTex);
+    gl.uniform1i(progText.u('uPaper'), 3); gl.uniform1i(progText.u('uMask'), 4);
+    gl.uniform4f(progText.u('uSel'), tx.chan === 0 ? 1 : 0, tx.chan === 1 ? 1 : 0, tx.chan === 2 ? 1 : 0, 0);
+    gl.uniform1f(progText.u('uProg'), tx.prog(t)); gl.uniform1f(progText.u('uPrev'), tx.prog(t - STEP));
+    gl.uniform3f(progText.u('uLay'), tx.lay[0], tx.lay[1], tx.lay[2]);
+    gl.uniform1f(progText.u('uAspect'), A);
+    gl.uniform3f(progText.u('uK'), tx.K[0], tx.K[1], tx.K[2]);
+    gl.uniform1f(progText.u('uAmt'), tx.amt); gl.uniform1f(progText.u('uWat'), tx.wat); gl.uniform1f(progText.u('uDepFrac'), tx.depFrac);
+    gl.uniform1i(progText.u('uSeal'), tx.seal);
+    gl.bindVertexArray(emptyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  gl.disable(gl.BLEND);
+
+  // --- 3. solver iterations (ping-pong cur → nxt) ---
+  const S = CONFIG.sim, F = forceAt(t);
+  gl.useProgram(progSim);
+  gl.uniform1i(progSim.u('uWater'), 0); gl.uniform1i(progSim.u('uPig'), 1); gl.uniform1i(progSim.u('uDep'), 2);
+  gl.uniform2f(progSim.u('uTexel'), 1 / SIM_W, 1 / SIM_H);
+  gl.uniform1f(progSim.u('uAspect'), A);
+  gl.uniform1f(progSim.u('uWaterDiff'), S.waterDiff);
+  gl.uniform1f(progSim.u('uPigDiff'), S.pigDiff * TL.pigDiff(t));
+  gl.uniform1f(progSim.u('uCarry'), S.carry);
+  gl.uniform1f(progSim.u('uRetain'), S.retain);
+  gl.uniform1f(progSim.u('uDry'), TL.dry(t) / CONFIG.simIterations * 2);
+  gl.uniform1f(progSim.u('uEdgeEvap'), S.edgeEvap);
+  const depS = TL.deposit(t);
+  gl.uniform1f(progSim.u('uDeposit'), S.deposit * depS);
+  gl.uniform1f(progSim.u('uEdgeDep'), S.edgeDep * S.deposit * 20 * depS);
+  gl.uniform1f(progSim.u('uDryDep'), S.dryDep * depS);
+  gl.uniform1f(progSim.u('uLift'), TL.lift(t));
+  gl.uniform1f(progSim.u('uDilute'), TL.dilute(t));
+  gl.uniform1f(progSim.u('uRelax'), S.relax);
+  gl.uniform1f(progSim.u('uStain'), S.stain);
+  if (F.f) {
+    gl.uniform1i(progSim.u('uForceType'), F.f.type);
+    gl.uniform2f(progSim.u('uFC'), F.f.c[0], F.f.c[1]);
+    gl.uniform1f(progSim.u('uFR'), F.f.R);
+    gl.uniform1f(progSim.u('uFS'), F.f.s * F.env * SIM_H / 640); // texels/step, resolution independent
+    gl.uniform4fv(progSim.u('uFP'), F.f.fp);
+    if (F.f.line) gl.uniform2fv(progSim.u('uLine'), F.f.line.flat());
+  } else {
+    gl.uniform1i(progSim.u('uForceType'), 0);
+    gl.uniform1f(progSim.u('uFS'), 0);
+  }
+  gl.bindVertexArray(emptyVao);
+  for (let i = 0; i < CONFIG.simIterations; i++) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, nxt.fb);
+    bindTex(0, cur.water); bindTex(1, cur.pig); bindTex(2, cur.dep);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const tmp = cur; cur = nxt; nxt = tmp;
+  }
+  simTime += STEP; stepCount++;
+}
+
+function render() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(progRender);
+  bindTex(0, cur.water); bindTex(1, cur.pig); bindTex(2, cur.dep); bindTex(3, paperTex);
+  gl.uniform1i(progRender.u('uWater'), 0); gl.uniform1i(progRender.u('uPig'), 1);
+  gl.uniform1i(progRender.u('uDep'), 2); gl.uniform1i(progRender.u('uPaper'), 3);
+  gl.uniform2f(progRender.u('uRes'), canvas.width, canvas.height);
+  gl.uniform2f(progRender.u('uSimRes'), SIM_W, SIM_H);
+  gl.uniform1f(progRender.u('uAspect'), A);
+  // camera: "the scroll breathes" — tiny zoom, drift and rotation over the whole film
+  const t = simTime, C = CONFIG.camera;
+  const scale = lerp(C.scale0, C.scale1, ss(t / CONFIG.duration)) + 0.003 * Math.sin(t * 0.05);
+  const m = (1 - 1 / scale) * 0.42;
+  gl.uniform1f(progRender.u('uScale'), scale);
+  gl.uniform1f(progRender.u('uRot'), C.rot * Math.sin(t * 0.023 + 0.6));
+  gl.uniform2f(progRender.u('uPan'), m * Math.sin(t * 0.019 + 0.3), m * 0.7 * Math.sin(t * 0.014 + 1.9));
+  gl.uniform1f(progRender.u('uPaperReveal'), TL.paperReveal(t));
+  gl.uniform1f(progRender.u('uFade'), ss((t - CONFIG.fadeOut[0]) / (CONFIG.fadeOut[1] - CONFIG.fadeOut[0])));
+  gl.bindVertexArray(emptyVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+/* ============================== UI ================================== */
+const ui = document.getElementById('ui'), fillEl = document.getElementById('fill');
+const chapterEls = [...document.querySelectorAll('#chapters span')];
+const pausedEl = document.getElementById('paused');
+let hideTimer = 0;
+function showUI() {
+  ui.classList.add('show'); document.body.classList.remove('idle');
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => { ui.classList.remove('show'); document.body.classList.add('idle'); }, CONFIG.ui.hideDelay);
+}
+function updateUI() {
+  const t = Math.min(simTime, CONFIG.duration);
+  fillEl.style.width = (t / CONFIG.duration * 100).toFixed(2) + '%';
+  let ci = 0;
+  CONFIG.chapters.forEach((c, i) => { if (t >= c.t0) ci = i; });
+  chapterEls.forEach((el, i) => el.classList.toggle('on', i === ci));
+}
+document.body.classList.add('idle');
+
+/* ============================== INPUT CONTROLS ====================== */
+let paused = false;
+function togglePause() { paused = !paused; pausedEl.classList.toggle('show', paused); showUI(); }
+function restart() { resetSim(); acc = 0; showUI(); }
+function toggleFullscreen() {
+  if (!document.fullscreenElement) (document.documentElement.requestFullscreen || (() => {})).call(document.documentElement);
+  else document.exitFullscreen && document.exitFullscreen();
+}
+window.addEventListener('mousemove', showUI);
+window.addEventListener('touchstart', showUI, { passive: true });
+canvas.addEventListener('click', togglePause);
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.code === 'KeyR') restart();
+  else if (e.code === 'KeyF') toggleFullscreen();
+  // ESC: browsers exit fullscreen natively
+});
+
+/* ============================== MAIN LOOP =========================== */
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, CONFIG.dprMax);
+  canvas.width = Math.max(1, Math.round(innerWidth * dpr));
+  canvas.height = Math.max(1, Math.round(innerHeight * dpr));
+}
+window.addEventListener('resize', resize);
+resize();
+
+buildMasks();
+// Rebuild glyph masks once the web font arrives — only while no text is being deposited.
+let fontPending = true;
+if (document.fonts && document.fonts.load) {
+  Promise.race([document.fonts.load("100px 'Ma Shan Zheng'", '彩墨分五色之印'), new Promise(r => setTimeout(r, 8000))])
+    .then(() => { if (document.fonts.check("100px 'Ma Shan Zheng'", '彩墨')) fontPending = 'ready'; else fontPending = false; })
+    .catch(() => { fontPending = false; });
+}
+function maybeRebuildMasks() {
+  if (fontPending !== 'ready') return;
+  const busy = scene.texts.some(tx => simTime > tx.t0 - 0.3 && simTime < tx.t1 + 0.3);
+  if (!busy) { buildMasks(); fontPending = false; }
+}
+
+resetSim();
+let acc = 0, last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.25);
+  last = now;
+  if (!paused) {
+    acc += dt;
+    let n = 0;
+    while (acc >= STEP && n < CONFIG.maxStepsPerFrame) { simStep(); acc -= STEP; n++; }
+    // machine too slow: keep every simulation step, let the film run slower instead
+    if (n === CONFIG.maxStepsPerFrame && acc > STEP) acc = STEP * 0.5;
+    if (simTime >= CONFIG.fadeOut[1]) resetSim(); // seamless loop from blank paper
+  }
+  maybeRebuildMasks();
+  render();
+  updateUI();
+  requestAnimationFrame(frame);
+}
+// optional: ?t=seconds fast-forwards (useful for reviewing a chapter)
+const startAt = +(QS.get('t') || 0);
+while (simTime < startAt) simStep();
+// debug hook for automated review
+window.__ink = { seek(t) { while (simTime < t) simStep(); render(); updateUI(); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4)); return simTime; }, pause() { paused = true; }, get t() { return simTime; } };
+if (QS.has('still')) { paused = true; render(); }
+else requestAnimationFrame(frame);
+</script>
+</body>
+</html>
